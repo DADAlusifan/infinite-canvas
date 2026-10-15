@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { normalizeModelImageSizes } from "@/lib/model-image-sizes";
 
 export type ApiCallFormat = "openai" | "gemini";
 export type ModelCapability = "image" | "video" | "text" | "audio";
@@ -13,6 +14,7 @@ export type ChannelModel = {
     name: string;
     capability: ModelCapability;
     script?: string;
+    imageSizes?: string[];
 };
 
 export type ModelChannel = {
@@ -207,6 +209,16 @@ export function resolveModelScript(config: AiConfig, value: string) {
     return findChannelModel(config, value)?.model.script?.trim() || "";
 }
 
+export function supportsModelImageSizes(channel: Pick<ModelChannel, "apiFormat">, model: ChannelModel) {
+    return model.capability === "image" && (channel.apiFormat === "openai" || Boolean(model.script?.trim()));
+}
+
+export function resolveModelImageSizes(config: AiConfig, value: string): string[] | undefined {
+    const match = findChannelModel(config, value);
+    if (!match || !supportsModelImageSizes(match.channel, match.model)) return undefined;
+    return match.model.imageSizes?.length ? match.model.imageSizes : undefined;
+}
+
 function isAiConfigReady(config: AiConfig, model: string) {
     const match = findChannelModel(config, model);
     return Boolean(match && match.channel.baseUrl.trim() && match.channel.apiKey.trim());
@@ -301,12 +313,13 @@ export function normalizeChannelModels(models: Array<string | ChannelModel> | un
     const seen = new Set<string>();
     const result: ChannelModel[] = [];
     for (const item of models || []) {
+        const imageSizes = typeof item === "string" ? undefined : normalizeModelImageSizes(item?.imageSizes);
         const name = (typeof item === "string" ? item : item?.name || "").trim();
         if (!name || seen.has(name)) continue;
         seen.add(name);
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
         const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
-        result.push({ name, capability, script });
+        result.push({ name, capability, script, ...(imageSizes ? { imageSizes } : {}) });
     }
     return result;
 }

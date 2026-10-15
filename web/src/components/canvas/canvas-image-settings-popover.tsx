@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { Settings2 } from "lucide-react";
+import { AlertCircle, Settings2 } from "lucide-react";
 import { Button } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { ImageSettingsPanel, imageQualityLabel, imageSizeLabel } from "@/components/image-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { formatModelImageSize, isModelImageSizeSupported } from "@/lib/model-image-sizes";
 import { useThemeStore } from "@/stores/use-theme-store";
-import type { AiConfig } from "@/stores/use-config-store";
+import { resolveModelImageSizes, type AiConfig } from "@/stores/use-config-store";
 
 type CanvasImageSettingsPopoverProps = {
     config: AiConfig;
@@ -29,7 +30,10 @@ export function CanvasImageSettingsPopover({ config, onConfigChange, onOpenChang
     const [buttonRect, setButtonRect] = useState<DOMRect | null>(null);
     const quality = config.quality || "auto";
     const count = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
-    const activeSize = config.size || "auto";
+    const activeSize = config.size?.trim() || "auto";
+    const modelSizes = resolveModelImageSizes(config, config.model);
+    const invalidSize = modelSizes && !isModelImageSizeSupported(modelSizes, activeSize);
+    const sizeLabel = modelSizes ? formatModelImageSize(activeSize) : imageSizeLabel(activeSize);
     const updateOpen = (nextOpen: boolean) => {
         setOpen(nextOpen);
         onOpenChange?.(nextOpen);
@@ -63,9 +67,9 @@ export function CanvasImageSettingsPopover({ config, onConfigChange, onOpenChang
     return (
         <>
             <span ref={buttonRef} className="inline-flex min-w-0">
-                <Button size="small" type="text" className={buttonClassName || "!h-8 !max-w-[180px] !justify-start !rounded-full !px-2.5"} style={{ background: theme.node.fill, color: theme.node.text }} icon={<Settings2 className="size-3.5" />} onClick={() => updateOpen(!open)}>
+                <Button size="small" type="text" className={buttonClassName || "!h-8 !max-w-[180px] !justify-start !rounded-full !px-2.5"} style={{ background: theme.node.fill, color: theme.node.text }} title={invalidSize ? t("modelImageSizes.invalidCurrent", { size: sizeLabel }) : sizeLabel} icon={invalidSize ? <AlertCircle className="size-3.5" /> : <Settings2 className="size-3.5" />} onClick={() => updateOpen(!open)}>
                     <span className="truncate">
-                        {imageQualityLabel(quality)} · {imageSizeLabel(activeSize)} · {t("canvas.controls.images", { count })}
+                        {imageQualityLabel(quality)} · {sizeLabel} · {t("canvas.controls.images", { count })}
                     </span>
                 </Button>
             </span>

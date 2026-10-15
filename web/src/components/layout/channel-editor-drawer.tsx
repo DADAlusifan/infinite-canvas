@@ -3,7 +3,8 @@ import { ListPlus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, supportsModelImageSizes, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { ModelImageSizesEditor } from "./model-image-sizes-editor";
 import { ModelScriptEditor } from "./model-script-editor";
 import { ModelSelectModal } from "./model-select-modal";
 
@@ -14,6 +15,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
     const [draft, setDraft] = useState<ModelChannel | null>(channel);
     const [selectOpen, setSelectOpen] = useState(false);
     const [scriptTarget, setScriptTarget] = useState<ScriptTarget | null>(null);
+    const [sizesTarget, setSizesTarget] = useState<ChannelModel | null>(null);
     const apiFormatOptions: Array<{ label: string; value: ApiCallFormat }> = [
         { label: "OpenAI", value: "openai" },
         { label: "Gemini", value: "gemini" },
@@ -22,6 +24,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
 
     useEffect(() => {
         if (open && channel) setDraft(channel);
+        setSizesTarget(null);
     }, [open, channel]);
 
     if (!draft) return null;
@@ -41,6 +44,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
 
     const setCapability = (name: string, capability: ModelCapability) => setModels(draft.models.map((model) => (model.name === name ? { ...model, capability } : model)));
     const setScript = (name: string, script: string) => setModels(draft.models.map((model) => (model.name === name ? { ...model, script: script || undefined } : model)));
+    const setImageSizes = (name: string, imageSizes: string[] | undefined) => setModels(draft.models.map((model) => (model.name === name ? { ...model, imageSizes } : model)));
     const removeModel = (name: string) => setModels(draft.models.filter((model) => model.name !== name));
 
     const save = () => {
@@ -102,6 +106,11 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                             </span>
                             <div className="flex shrink-0 items-center gap-2">
                                 <Segmented size="small" value={model.capability} options={capabilityOptions} onChange={(value) => setCapability(model.name, value as ModelCapability)} />
+                                {model.capability === "image" && (
+                                    <Button size="small" type="text" disabled={!supportsModelImageSizes(draft, model)} title={!supportsModelImageSizes(draft, model) ? t("modelImageSizes.unsupportedProtocol") : undefined} onClick={() => setSizesTarget(model)}>
+                                        {t("modelImageSizes.button")}{model.imageSizes?.length ? ` (${model.imageSizes.length})` : ""}
+                                    </Button>
+                                )}
                                 <Button size="small" type={model.script ? "primary" : "default"} ghost={Boolean(model.script)} onClick={() => setScriptTarget({ name: model.name, capability: model.capability, value: model.script || "" })}>
                                     {t(model.script ? "config.channelEditor.scriptReady" : "config.channelEditor.script")}
                                 </Button>
@@ -115,6 +124,16 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
             </div>
 
             <ModelSelectModal open={selectOpen} channel={draft} selectedNames={draft.models.map((model) => model.name)} onConfirm={applySelection} onClose={() => setSelectOpen(false)} />
+
+            {sizesTarget && (
+                <ModelImageSizesEditor
+                    key={`${draft.id}:${sizesTarget.name}`}
+                    modelName={sizesTarget.name}
+                    value={sizesTarget.imageSizes}
+                    onSave={(sizes) => setImageSizes(sizesTarget.name, sizes)}
+                    onClose={() => setSizesTarget(null)}
+                />
+            )}
 
             <ModelScriptEditor
                 open={Boolean(scriptTarget)}

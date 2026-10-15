@@ -1,11 +1,12 @@
 import { type ReactNode, useState } from "react";
-import { ConfigProvider, Switch } from "antd";
+import { ConfigProvider, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
 import { type CanvasTheme } from "@/lib/canvas-theme";
 import { computeMediaSize, inferMediaRatio, inferMediaScale, mediaRatioOptions, mediaScaleOptions, readMediaDimensions } from "@/lib/media-size";
-import type { AiConfig } from "@/stores/use-config-store";
+import { formatModelImageSize, isModelImageSizeSupported, normalizeImageSizeOption } from "@/lib/model-image-sizes";
+import { resolveModelImageSizes, type AiConfig } from "@/stores/use-config-store";
 
 const qualityOptions = [
     { value: "auto", labelKey: "auto" },
@@ -36,7 +37,9 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
     const [snapDimensionToStep, setSnapDimensionToStep] = useState(true);
     const quality = config.quality || "auto";
     const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
-    const activeSize = config.size || "auto";
+    const activeSize = config.size?.trim() || "auto";
+    const modelSizes = resolveModelImageSizes(config, config.model);
+    const invalidSize = modelSizes && !isModelImageSizeSupported(modelSizes, activeSize);
     const transparentBackground = config.background === "transparent";
     const selectedScale = inferMediaScale(activeSize);
     const selectedRatio = inferMediaRatio(activeSize);
@@ -73,52 +76,68 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         ))}
                     </div>
                 </div>
-                <div className="space-y-2.5">
-                    <div className="flex items-center justify-between gap-3">
-                        <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.size")}</SettingTitle>
-                        <div className="flex items-center gap-2">
-                            <span className="text-xs font-medium" style={{ color: theme.node.muted }}>
-                                {t("settingsPanels.image.align16")}
-                            </span>
-                            <span title={t("settingsPanels.image.align16Hint")} onMouseDown={(event) => event.stopPropagation()}>
-                                <Switch size="small" checked={snapDimensionToStep} onChange={setSnapDimensionToStep} />
-                            </span>
+                {modelSizes ? (
+                    <div className="space-y-2.5">
+                        <SettingTitle color={theme.node.muted}>{t("modelImageSizes.label")}</SettingTitle>
+                        {invalidSize ? <Typography.Text type="danger" role="alert" className="block text-xs">{t("modelImageSizes.invalidCurrent", { size: formatModelImageSize(activeSize) })}</Typography.Text> : null}
+                        <div className="grid grid-cols-2 gap-2.5">
+                            {modelSizes.map((size) => (
+                                <OptionPill key={size} selected={normalizeImageSizeOption(activeSize) === size} theme={theme} onClick={() => onConfigChange("size", size)}>
+                                    {formatModelImageSize(size)}
+                                </OptionPill>
+                            ))}
                         </div>
                     </div>
-                    <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2.5">
-                        <DimensionInput prefix="W" value={dimensions.width} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
-                        <span className="text-lg opacity-45">↔</span>
-                        <DimensionInput prefix="H" value={dimensions.height} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
-                    </div>
-                </div>
-                <div className="space-y-2.5">
-                    <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.resolution")}</SettingTitle>
-                    <div className="grid grid-cols-4 gap-2.5">
-                        {mediaScaleOptions.map((value) => (
-                            <OptionPill key={value} selected={selectedScale === value} theme={theme} onClick={() => selectScale(value)}>
-                                {value === "auto" ? t("settingsPanels.common.auto") : value}
-                            </OptionPill>
-                        ))}
-                    </div>
-                </div>
-                <div className="space-y-2.5">
-                    <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.aspectRatio")}</SettingTitle>
-                    <div className="grid grid-cols-4 gap-2.5">
-                        {mediaRatioOptions.map((item) => (
-                            <button
-                                key={item.value}
-                                type="button"
-                                className="flex h-[72px] cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border bg-transparent text-sm transition hover:opacity-80"
-                                style={{ borderColor: selectedRatio === item.value ? theme.node.text : theme.node.stroke, background: "transparent", color: theme.node.text }}
-                                onMouseDown={(event) => event.stopPropagation()}
-                                onClick={() => selectRatio(item.value)}
-                            >
-                                <AspectIcon width={item.width} height={item.height} color={theme.node.text} />
-                                <span>{item.value === "auto" ? t("settingsPanels.common.auto") : item.value}</span>
-                            </button>
-                        ))}
-                    </div>
-                </div>
+                ) : (
+                    <>
+                        <div className="space-y-2.5">
+                            <div className="flex items-center justify-between gap-3">
+                                <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.size")}</SettingTitle>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-xs font-medium" style={{ color: theme.node.muted }}>
+                                        {t("settingsPanels.image.align16")}
+                                    </span>
+                                    <span title={t("settingsPanels.image.align16Hint")} onMouseDown={(event) => event.stopPropagation()}>
+                                        <Switch size="small" checked={snapDimensionToStep} onChange={setSnapDimensionToStep} />
+                                    </span>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2.5">
+                                <DimensionInput prefix="W" value={dimensions.width} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
+                                <span className="text-lg opacity-45">↔</span>
+                                <DimensionInput prefix="H" value={dimensions.height} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
+                            </div>
+                        </div>
+                        <div className="space-y-2.5">
+                            <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.resolution")}</SettingTitle>
+                            <div className="grid grid-cols-4 gap-2.5">
+                                {mediaScaleOptions.map((value) => (
+                                    <OptionPill key={value} selected={selectedScale === value} theme={theme} onClick={() => selectScale(value)}>
+                                        {value === "auto" ? t("settingsPanels.common.auto") : value}
+                                    </OptionPill>
+                                ))}
+                            </div>
+                        </div>
+                        <div className="space-y-2.5">
+                            <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.aspectRatio")}</SettingTitle>
+                            <div className="grid grid-cols-4 gap-2.5">
+                                {mediaRatioOptions.map((item) => (
+                                    <button
+                                        key={item.value}
+                                        type="button"
+                                        className="flex h-[72px] cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border bg-transparent text-sm transition hover:opacity-80"
+                                        style={{ borderColor: selectedRatio === item.value ? theme.node.text : theme.node.stroke, background: "transparent", color: theme.node.text }}
+                                        onMouseDown={(event) => event.stopPropagation()}
+                                        onClick={() => selectRatio(item.value)}
+                                    >
+                                        <AspectIcon width={item.width} height={item.height} color={theme.node.text} />
+                                        <span>{item.value === "auto" ? t("settingsPanels.common.auto") : item.value}</span>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </>
+                )}
                 <div className="flex items-center justify-between gap-3">
                     <div className="space-y-0.5">
                         <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.transparent")}</SettingTitle>

@@ -5,6 +5,7 @@ import type { CanvasNodeData } from "../src/types/canvas";
 // Config and i18n use browser storage during module initialization.
 const values = new Map<string, string>();
 const originalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
 Object.defineProperty(globalThis, "localStorage", {
     configurable: true,
     value: {
@@ -13,9 +14,12 @@ Object.defineProperty(globalThis, "localStorage", {
         removeItem: (key: string) => values.delete(key),
     },
 });
+Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage } });
 afterAll(() => {
     if (originalStorage) Object.defineProperty(globalThis, "localStorage", originalStorage);
     else Reflect.deleteProperty(globalThis, "localStorage");
+    if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+    else Reflect.deleteProperty(globalThis, "window");
 });
 
 const { defaultConfig, resolveModelForCapability, useConfigStore } = await import("../src/stores/use-config-store");

@@ -1,13 +1,14 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, resolveModelImageSizes, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
 import { imageSizePresets, inferMediaScale } from "@/lib/media-size";
+import { normalizeImageSizeOption } from "@/lib/model-image-sizes";
 import type { ReferenceImage } from "@/types/image";
 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
@@ -165,8 +166,19 @@ function validateImageSize(width: number, height: number) {
     if (pixels < IMAGE_MIN_PIXELS || pixels > IMAGE_MAX_PIXELS) throw new Error(apiText("imagePixelLimit"));
 }
 
-function resolveRequestSize(size: string) {
-    const value = size.trim();
+export function resolveImageRequestSize(config: AiConfig) {
+    const selectedModel = config.model || config.imageModel;
+    const imageSizes = resolveModelImageSizes(config, selectedModel);
+    const requestConfig = resolveModelRequestConfig(config, selectedModel);
+    if (requestConfig.apiFormat === "gemini" && !resolveModelScript(config, selectedModel)) return undefined;
+    const value = config.size.trim();
+    if (imageSizes) {
+        const normalized = normalizeImageSizeOption(value || "auto");
+        if (!normalized || !imageSizes.includes(normalized)) {
+            throw new Error(i18n.t("modelImageSizes.invalidCurrent", { size: value || "auto" }));
+        }
+        return normalized === "auto" ? undefined : normalized;
+    }
     if (!value || value.toLowerCase() === "auto") return undefined;
     const dimensions = parseImageDimensions(value);
     if (dimensions) {
@@ -692,12 +704,13 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
 }
 
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    const requestSize = resolveImageRequestSize(config);
+    const selectedModel = config.model || config.imageModel;
+    const requestConfig = resolveModelRequestConfig(config, selectedModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
-    const script = resolveModelScript(config, config.model || config.imageModel);
+    const script = resolveModelScript(config, selectedModel);
     if (script) {
         const quality = normalizeQuality(config.quality);
-        const requestSize = resolveRequestSize(config.size);
         const background = normalizeBackground(config.background);
         try {
             const result = await runModelPlugin({
@@ -722,7 +735,6 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
         }
     }
     const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(config.size);
     const background = normalizeBackground(config.background);
     try {
         const response = await axios.post<ImageApiResponse>(
@@ -752,13 +764,14 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
 }
 
 export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    const requestSize = resolveImageRequestSize(config);
+    const selectedModel = config.model || config.imageModel;
+    const requestConfig = resolveModelRequestConfig(config, selectedModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+    const script = resolveModelScript(config, selectedModel);
     const requestPrompt = buildImageReferencePromptText(prompt, references);
-    const script = resolveModelScript(config, config.model || config.imageModel);
     if (script) {
         const quality = normalizeQuality(config.quality);
-        const requestSize = resolveRequestSize(config.size);
         const background = normalizeBackground(config.background);
         const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
         try {
@@ -785,7 +798,6 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     }
 
     const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(config.size);
     const background = normalizeBackground(config.background);
     const formData = new FormData();
     formData.set("model", requestConfig.model);

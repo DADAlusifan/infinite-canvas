@@ -5,7 +5,7 @@ import { Group, Video } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
-import { requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
+import { requestEdit, requestGeneration, requestImageQuestion, resolveImageRequestSize } from "@/services/api/image";
 import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
 import { createVideoGenerationTask, isVideoTaskFailed, storeGeneratedVideo, waitForVideoGenerationTask } from "@/services/api/video";
 import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
@@ -1999,6 +1999,12 @@ function InfiniteCanvasPage() {
                 openConfigDialog(true);
                 return;
             }
+            try {
+                if (payload.generate) resolveImageRequestSize(generationConfig);
+            } catch (error) {
+                message.error(error instanceof Error ? error.message : t("canvas.projectPage.maskFailed"));
+                return;
+            }
             const userPrompt = payload.prompt.trim();
             const prompt = t("canvas.projectPage.maskPrompt", { source: imageReferenceLabel(0), mask: imageReferenceLabel(1), prompt: userPrompt });
             setMaskEditNodeId(null);
@@ -2335,6 +2341,12 @@ function InfiniteCanvasPage() {
             // useBuiltinPanel.writeBackToSelf reuses built-in generation while writing the result back to the plugin node.
             // Image mode currently supports display-only nodes such as panoramas, with a useBuiltinPanel.promptPrefix.
             const builtinPanel = sourceNode ? getNodeDefinition(sourceNode.type)?.useBuiltinPanel : undefined;
+            try {
+                if (mode === "image" || (builtinPanel?.writeBackToSelf && builtinPanel.mode === "image")) resolveImageRequestSize(generationConfig);
+            } catch (error) {
+                message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
+                return;
+            }
             if (sourceNode && builtinPanel?.writeBackToSelf && builtinPanel.mode === "image") {
                 const scene = prompt.trim();
                 if (!scene) return;
@@ -2787,6 +2799,12 @@ function InfiniteCanvasPage() {
                     : { ...buildGenerationConfig(effectiveConfig, sourceNode, node.type === CanvasNodeType.Text ? "text" : node.type === CanvasNodeType.Video ? "video" : node.type === CanvasNodeType.Audio ? "audio" : "image"), count: "1" };
             if (!isAiConfigReady(generationConfig, generationConfig.model)) {
                 openConfigDialog(true);
+                return;
+            }
+            try {
+                if (node.type !== CanvasNodeType.Text && node.type !== CanvasNodeType.Video && node.type !== CanvasNodeType.Audio) resolveImageRequestSize(generationConfig);
+            } catch (error) {
+                message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
                 return;
             }
 

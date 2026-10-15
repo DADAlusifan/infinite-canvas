@@ -16,7 +16,8 @@ import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent }
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
 import { computeMediaSize, inferMediaRatio, inferMediaScale, mediaScaleOptions, parseVideoResolution } from "@/lib/media-size";
-import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { formatModelImageSize, isModelImageSizeSupported, normalizeImageSizeOption } from "@/lib/model-image-sizes";
+import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, resolveModelImageSizes, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -70,6 +71,11 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     const editingChannel = config.channels.find((channel) => channel.id === editingChannelId) || null;
     const locale = i18n.resolvedLanguage as AppLocale;
     const imageResolutionOptions = mediaScaleOptions.map((value) => ({ value, label: value === "auto" ? t("settingsPanels.common.auto") : value.toUpperCase() }));
+    const modelImageSizes = resolveModelImageSizes(config, config.imageModel);
+    const imageSize = config.size?.trim() || "auto";
+    const invalidImageSize = modelImageSizes && !isModelImageSizeSupported(modelImageSizes, imageSize);
+    const modelImageSizeOptions = modelImageSizes?.map((size) => ({ value: size, label: formatModelImageSize(size), disabled: false }));
+    if (invalidImageSize) modelImageSizeOptions?.unshift({ value: imageSize, label: t("modelImageSizes.currentUnsupported", { size: formatModelImageSize(imageSize) }), disabled: true });
     useEffect(() => setActiveTab(initialTab), [initialTab]);
 
     const saveConfig = (nextConfig: AiConfig) => {
@@ -245,8 +251,12 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                             onBlur={(event) => updateConfig("canvasImageCount", normalizeImageCount(event.target.value))}
                                         />
                                     </Form.Item>
-                                    <Form.Item label={t("config.preferences.imageResolution")} className="mb-4">
-                                        <Select value={inferMediaScale(config.size)} options={imageResolutionOptions} onChange={(scale) => updateConfig("size", computeMediaSize(scale, inferMediaRatio(config.size)))} />
+                                    <Form.Item label={t(modelImageSizes ? "modelImageSizes.label" : "config.preferences.imageResolution")} validateStatus={invalidImageSize ? "error" : undefined} help={invalidImageSize ? t("modelImageSizes.invalidCurrent", { size: formatModelImageSize(imageSize) }) : undefined} className="mb-4">
+                                        {modelImageSizes ? (
+                                            <Select value={invalidImageSize ? imageSize : normalizeImageSizeOption(imageSize) || imageSize} options={modelImageSizeOptions} onChange={(size) => updateConfig("size", size)} />
+                                        ) : (
+                                            <Select value={inferMediaScale(config.size)} options={imageResolutionOptions} onChange={(scale) => updateConfig("size", computeMediaSize(scale, inferMediaRatio(config.size)))} />
+                                        )}
                                     </Form.Item>
                                     <Form.Item label={t("config.preferences.videoResolution")} className="mb-4">
                                         <Select value={parseVideoResolution(config.vquality)} options={videoResolutionOptions} onChange={(value) => updateConfig("vquality", value)} />
