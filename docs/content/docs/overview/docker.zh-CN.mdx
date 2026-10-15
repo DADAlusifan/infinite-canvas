@@ -18,7 +18,7 @@ docker compose up -d
 启动后访问：
 
 ```text
-http://localhost:3000
+http://localhost:23147
 ```
 
 ## 本地构建镜像
@@ -69,7 +69,7 @@ services:
   app:
     image: ghcr.io/basketikun/infinite-canvas:latest
     ports:
-      - "3000:3000"
+      - "23147:3000"
     environment:
       ANALYTICS_GA4_ID: G-XXXXXXXXXX
       ANALYTICS_BAIDU_ID: e8263761cc5c32f5f7a855b8203b965a
@@ -78,7 +78,7 @@ services:
 或使用 `docker run`：
 
 ```bash
-docker run -d -p 3000:3000 \
+docker run -d -p 23147:3000 \
   -e ANALYTICS_GA4_ID=G-XXXXXXXXXX \
   -e ANALYTICS_BAIDU_ID=e8263761cc5c32f5f7a855b8203b965a \
   ghcr.io/basketikun/infinite-canvas:latest

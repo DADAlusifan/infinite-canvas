@@ -42,10 +42,12 @@ http://127.0.0.1:23210/https://api.openai.com/v1/models
 ```
 4:05:42 PM GET https://api.openai.com/v1/models -> 200 0.9s
 4:05:43 PM POST https://api.openai.com/v1/images/generations -> 200 26.4s
-4:05:45 PM GET https://api.example.com/v1/models -> failed (fetch failed) 1.6s
+4:05:45 PM GET https://api.example.com/v1/models -> failed (fetch failed (UND_ERR_CONNECT_TIMEOUT)) 1.6s
 ```
 
 日志在收到上游响应头时打印，所以流式请求会立刻出现一行，而不是等整段响应结束。日志只输出到终端，不落盘，也不包含请求头和请求体，因此不会泄露 API Key。
+
+转发失败时，终端和 HTTP 502 响应的 `error` 字段会保留底层网络错误码，例如 `UND_ERR_CONNECT_TIMEOUT`、`ENOTFOUND` 或 `ECONNRESET`；多个连接错误的错误码会去重列出。配置页的「测试连接」只检查本地代理是否在线，不代表代理能访问目标服务。代理使用 Node.js `fetch` 发起出站请求，不会自动继承 Windows 系统代理。
 
 ## 安全提示
 

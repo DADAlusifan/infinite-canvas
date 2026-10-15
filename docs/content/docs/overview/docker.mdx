@@ -13,7 +13,7 @@ cd infinite-canvas
 docker compose up -d
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:23147`.
 
 ## Build locally
 
@@ -53,7 +53,7 @@ services:
   app:
     image: ghcr.io/basketikun/infinite-canvas:latest
     ports:
-      - "3000:3000"
+      - "23147:3000"
     environment:
       ANALYTICS_GA4_ID: G-XXXXXXXXXX
       ANALYTICS_BAIDU_ID: e8263761cc5c32f5f7a855b8203b965a

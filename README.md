@@ -140,7 +140,7 @@ cd infinite-canvas
 docker compose up -d
 ```
 
-运行后默认端口3000，可访问 `http://localhost:3000`。
+运行后默认端口23147，可访问 `http://localhost:23147`。
 
 首次打开后进入右上角配置，填入自己的 OpenAI 兼容 `Base URL` 和 `API Key`。
 

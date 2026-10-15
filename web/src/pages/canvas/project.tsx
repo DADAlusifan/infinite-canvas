@@ -1813,10 +1813,11 @@ function InfiniteCanvasPage() {
         async (nodeId: string, position: VideoFramePosition) => {
             setContextMenu(null);
             const node = nodesRef.current.find((item) => item.id === nodeId);
-            const video = Array.from(containerRef.current!.querySelectorAll<HTMLVideoElement>("video[data-canvas-video]")).find((item) => item.dataset.canvasVideo === nodeId);
-            if (node?.type !== CanvasNodeType.Video || !node.metadata?.content || !video) return message.error(t("canvas.videoFrames.failed"));
+            const video = Array.from(containerRef.current?.querySelectorAll<HTMLVideoElement>("video[data-canvas-video]") || []).find((item) => item.dataset.canvasVideo === nodeId);
+            if (node?.type !== CanvasNodeType.Video || !node.metadata?.content) return message.error(t("canvas.videoFrames.failed"));
+            if (position === "current" && !video) return message.error(t("canvas.videoFrames.notReady"));
             try {
-                const image = await uploadImage(await captureVideoFrame(node.metadata.content, position, video.currentTime));
+                const image = await uploadImage(await captureVideoFrame(node.metadata.content, position, video?.currentTime || 0, { storageKey: node.metadata.storageKey, player: video }));
                 const size = fitNodeSize(image.width, image.height, VIDEO_NODE_MAX_WIDTH, VIDEO_NODE_MAX_HEIGHT);
                 const id = nanoid();
                 const x = node.position.x + node.width + 96;
@@ -1836,8 +1837,8 @@ function InfiniteCanvasPage() {
                 setSelectedConnectionId(null);
                 setDialogNodeId(id);
                 message.success(t("canvas.videoFrames.captured"));
-            } catch {
-                message.error(t("canvas.videoFrames.failed"));
+            } catch (error) {
+                message.error(error instanceof Error ? t("canvas.videoFrames.failedWithReason", { reason: error.message }) : t("canvas.videoFrames.failed"));
             }
         },
         [message, t],

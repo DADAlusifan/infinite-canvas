@@ -1,51 +1,89 @@
+import i18n from "@/i18n";
+import { getMediaBlob } from "@/services/file-storage";
+import { withLocalProxy } from "@/stores/use-config-store";
+
 export type VideoFramePosition = "first" | "last" | "current";
 
-export async function captureVideoFrame(source: string, position: VideoFramePosition, currentTime: number) {
+const frameError = (key: string) => new Error(i18n.t(`canvas.videoFrames.${key}`));
+const isSecurityError = (error: unknown) => error instanceof DOMException && error.name === "SecurityError";
+
+export async function captureVideoFrame(source: string, position: VideoFramePosition, currentTime: number, options: { storageKey?: string; player?: HTMLVideoElement } = {}) {
+    const player = options.player;
+    if (position === "current" && player && !player.seeking && player.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        try {
+            return await exportFrame(player);
+        } catch (error) {
+            // A remote player may be viewable but not canvas-readable; retry through the configured source below.
+            if (!isSecurityError(error)) throw error;
+        }
+    }
+
     const video = document.createElement("video");
     video.crossOrigin = "anonymous";
     video.muted = true;
     video.playsInline = true;
     video.preload = "auto";
+    let objectUrl: string | undefined;
     try {
-        const metadataLoaded = waitForVideo(video, "loadedmetadata");
-        video.src = source;
-        video.load();
+        const blob = options.storageKey ? await getMediaBlob(options.storageKey) : null;
+        if (blob) objectUrl = URL.createObjectURL(blob);
+        await waitForVideo(video, "loadeddata", () => {
+            video.src = objectUrl || withLocalProxy(source);
+            video.load();
+        });
 
-        await metadataLoaded;
+        if (!Number.isFinite(video.duration) || video.duration <= 0) throw frameError("notReady");
         const endTime = Math.max(0, video.duration - 0.001);
-        const time = position === "first" ? 0 : position === "last" ? endTime : Math.min(currentTime, endTime);
-        if (time) {
-            const seeked = waitForVideo(video, "seeked");
-            video.currentTime = time;
-            await seeked;
-        } else if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-            await waitForVideo(video, "loadeddata");
+        const time = position === "first" ? 0 : position === "last" ? endTime : Math.max(0, Math.min(currentTime, endTime));
+        if (video.currentTime !== time) {
+            await waitForVideo(video, "seeked", () => { video.currentTime = time; });
         }
+        if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) await waitForVideo(video, "loadeddata");
 
-        const canvas = document.createElement("canvas");
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        canvas.getContext("2d")!.drawImage(video, 0, 0);
-        return await new Promise<Blob>((resolve, reject) => canvas.toBlob((result) => (result ? resolve(result) : reject(new Error("Failed to capture video frame"))), "image/png"));
+        return await exportFrame(video);
+    } catch (error) {
+        if (isSecurityError(error)) throw frameError("crossOrigin");
+        throw error;
     } finally {
         video.removeAttribute("src");
         video.load();
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
     }
 }
 
-function waitForVideo(video: HTMLVideoElement, eventName: "loadedmetadata" | "loadeddata" | "seeked") {
+function exportFrame(video: HTMLVideoElement) {
+    if (!video.videoWidth || !video.videoHeight || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) throw frameError("notReady");
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext("2d");
+    if (!context) throw frameError("failed");
+    context.drawImage(video, 0, 0);
+    return new Promise<Blob>((resolve, reject) => canvas.toBlob((result) => (result ? resolve(result) : reject(frameError("failed"))), "image/png"));
+}
+
+function waitForVideo(video: HTMLVideoElement, eventName: "loadeddata" | "seeked", start?: () => void) {
     return new Promise<void>((resolve, reject) => {
-        const finish = () => {
+        const cleanup = () => {
             video.removeEventListener(eventName, finish);
             video.removeEventListener("error", fail);
+        };
+        const finish = () => {
+            cleanup();
             resolve();
         };
         const fail = () => {
-            video.removeEventListener(eventName, finish);
-            video.removeEventListener("error", fail);
-            reject(new Error("Failed to read video frame"));
+            cleanup();
+            reject(frameError(video.error?.code === MediaError.MEDIA_ERR_DECODE ? "decodeFailed" : "readFailed"));
         };
         video.addEventListener(eventName, finish);
         video.addEventListener("error", fail);
+        try {
+            if (video.error) fail();
+            else start?.();
+        } catch (error) {
+            cleanup();
+            reject(error);
+        }
     });
 }

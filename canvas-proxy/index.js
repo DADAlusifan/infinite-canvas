@@ -73,6 +73,19 @@ function logForward(method, target, outcome, startedAt) {
     console.log(`${new Date().toLocaleTimeString()} ${method} ${target} -> ${outcome} ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 }
 
+function errorMessage(error) {
+    const codes = new Set();
+    const collectCodes = (current) => {
+        if (!current || typeof current !== "object") return;
+        if (typeof current.code === "string") codes.add(current.code);
+        collectCodes(current.cause);
+        if (current instanceof AggregateError) current.errors.forEach(collectCodes);
+    };
+    collectCodes(error);
+    const message = error instanceof Error ? error.message : String(error);
+    return codes.size ? `${message} (${[...codes].join(", ")})` : message;
+}
+
 async function forward(req, res, target) {
     const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
     const upstream = await fetch(target, { method: req.method, headers: requestHeaders(req), body, redirect: "follow" });
@@ -106,7 +119,7 @@ export function createProxyServer() {
         forward(req, res, target)
             .then((status) => logForward(method, target, status, startedAt))
             .catch((error) => {
-                const reason = error instanceof Error ? error.message : String(error);
+                const reason = errorMessage(error);
                 logForward(method, target, `failed (${reason})`, startedAt);
                 if (res.headersSent) {
                     res.destroy();
