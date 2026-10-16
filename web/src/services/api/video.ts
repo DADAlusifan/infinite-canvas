@@ -1,3 +1,5 @@
+import { startStorageActivity } from "@/services/storage/maintenance";
+import { isDesktop } from "@/services/desktop/runtime";
 import axios from "axios";
 import { nanoid } from "nanoid";
 
@@ -44,19 +46,25 @@ function aiHeaders(config: AiConfig, contentType?: string) {
 }
 
 export async function requestVideoGeneration(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: VideoMediaOptions): Promise<VideoGenerationResult> {
-    return waitForVideoGenerationTask(config, await createVideoGenerationTask(config, prompt, references, options), options);
+    const finishActivity = startStorageActivity();
+    try {
+        return await waitForVideoGenerationTask(config, await createVideoGenerationTask(config, prompt, references, options), options);
+    } finally { finishActivity(); }
 }
 
 export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-        const state = await pollVideoGenerationTask(config, task, options);
-        if (state.status === "completed") return state.result;
-        if (state.status === "failed") throw videoTaskFailed(state.error);
-        if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: "" }));
-        await delay(2500, options?.signal);
-    }
-    throw new Error(apiText("videoTimeout", { provider: "" }));
+    const finishActivity = startStorageActivity();
+    try {
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+            if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+            const state = await pollVideoGenerationTask(config, task, options);
+            if (state.status === "completed") return state.result;
+            if (state.status === "failed") throw videoTaskFailed(state.error);
+            if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: "" }));
+            await delay(2500, options?.signal);
+        }
+        throw new Error(apiText("videoTimeout", { provider: "" }));
+    } finally { finishActivity(); }
 }
 
 export function isVideoTaskFailed(error: unknown) {
@@ -70,24 +78,30 @@ function videoTaskFailed(message: string) {
 }
 
 export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
-    const selectedModel = (config.model || config.videoModel).trim();
-    const requestConfig = resolveModelRequestConfig(config, selectedModel);
-    const script = resolveModelScript(config, selectedModel);
-    if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
-    assertVideoConfig(requestConfig, requestConfig.model);
-    if (requestConfig.apiFormat === "gemini") return createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
-    return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
+    const finishActivity = startStorageActivity();
+    try {
+        const selectedModel = (config.model || config.videoModel).trim();
+        const requestConfig = resolveModelRequestConfig(config, selectedModel);
+        const script = resolveModelScript(config, selectedModel);
+        if (script) return await createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
+        assertVideoConfig(requestConfig, requestConfig.model);
+        if (requestConfig.apiFormat === "gemini") return await createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
+        return await createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
+    } finally { finishActivity(); }
 }
 
 export async function pollVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
-    if (task.provider === "plugin") {
-        const result = pluginVideoResults.get(task.id);
-        return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
-    }
-    const requestConfig = resolveModelRequestConfig(config, task.model);
-    assertVideoConfig(requestConfig, requestConfig.model);
-    if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
-    return pollOpenAIVideoTask(requestConfig, task, options);
+    const finishActivity = startStorageActivity();
+    try {
+        if (task.provider === "plugin") {
+            const result = pluginVideoResults.get(task.id);
+            return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
+        }
+        const requestConfig = resolveModelRequestConfig(config, task.model);
+        assertVideoConfig(requestConfig, requestConfig.model);
+        if (task.provider === "gemini") return await pollGeminiVideoTask(requestConfig, task, options);
+        return await pollOpenAIVideoTask(requestConfig, task, options);
+    } finally { finishActivity(); }
 }
 
 async function createPluginVideoTask(config: AiConfig, model: string, script: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
@@ -135,15 +149,19 @@ function videoPluginResult(result: unknown): VideoGenerationResult {
 }
 
 export async function storeGeneratedVideo(result: VideoGenerationResult): Promise<UploadedFile> {
-    if (result.blob) return uploadMediaFile(result.blob, "video");
-    if (result.url) {
-        try {
-            return await uploadMediaFile(result.url, "video");
-        } catch {
-            return { url: result.url, storageKey: "", bytes: 0, mimeType: result.mimeType || "video/mp4" };
+    const finishActivity = startStorageActivity();
+    try {
+        if (result.blob) return await uploadMediaFile(result.blob, "video");
+        if (result.url) {
+            try {
+                return await uploadMediaFile(result.url, "video");
+            } catch (error) {
+                if (isDesktop()) throw error;
+                return { url: result.url, storageKey: "", bytes: 0, mimeType: result.mimeType || "video/mp4" };
+            }
         }
-    }
-    throw new Error(apiText("noPlayableVideo"));
+        throw new Error(apiText("noPlayableVideo"));
+    } finally { finishActivity(); }
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {

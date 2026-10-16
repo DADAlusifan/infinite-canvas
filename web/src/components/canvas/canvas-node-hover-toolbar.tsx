@@ -1,6 +1,7 @@
+import { preferences } from "@/services/storage/preferences";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { App, Modal, Segmented, Tooltip } from "antd";
-import { Download, Ellipsis, FolderPlus, Image as ImageIcon, Info, MessageSquare, Minus, Music2, Plus, RefreshCw, Settings2, Trash2, Ungroup, Upload, Video } from "lucide-react";
+import { App, Button, Modal, Segmented, Tooltip } from "antd";
+import { Download, Ellipsis, FolderOpen, FolderPlus, Image as ImageIcon, Info, MessageSquare, Minus, Music2, Plus, RefreshCw, Settings2, Trash2, Ungroup, Upload, Video } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
@@ -11,6 +12,7 @@ import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasNodeType, type CanvasNodeData, type ViewportTransform } from "@/types/canvas";
 import type { CanvasNodeToolbarItem } from "@/types/canvas-plugin";
 import { ImageToolSettingsModal, type ImageToolbarSettingsTool } from "./canvas-image-toolbar-settings-modal";
+import { desktopInvoke, isDesktop } from "@/services/desktop/runtime";
 import { IMAGE_QUICK_TOOLS_STORAGE_KEY, buildImageToolbarTools, defaultImageQuickToolIds, readImageQuickToolsConfig, type ImageQuickToolId } from "./canvas-image-toolbar-tools";
 
 type CanvasNodeHoverToolbarProps = {
@@ -89,14 +91,14 @@ export function CanvasNodeHoverToolbar({
 
     useEffect(() => {
         try {
-            const stored = window.localStorage.getItem(IMAGE_QUICK_TOOLS_STORAGE_KEY);
+            const stored = preferences.getItem(IMAGE_QUICK_TOOLS_STORAGE_KEY);
             if (!stored) return;
             const parsed = JSON.parse(stored) as unknown;
             const config = readImageQuickToolsConfig(parsed);
             setQuickImageToolIds(config.ids);
             setShowImageToolLabels(config.showLabels);
         } catch {
-            window.localStorage.removeItem(IMAGE_QUICK_TOOLS_STORAGE_KEY);
+            preferences.removeItem(IMAGE_QUICK_TOOLS_STORAGE_KEY);
         }
     }, []);
 
@@ -178,7 +180,7 @@ export function CanvasNodeHoverToolbar({
         const config = { ids: draftImageToolIds, showLabels: draftShowImageToolLabels };
         setQuickImageToolIds(config.ids);
         setShowImageToolLabels(config.showLabels);
-        window.localStorage.setItem(IMAGE_QUICK_TOOLS_STORAGE_KEY, JSON.stringify(config));
+        preferences.setItem(IMAGE_QUICK_TOOLS_STORAGE_KEY, JSON.stringify(config));
         closeImageToolSettings();
     };
 
@@ -217,6 +219,7 @@ export function CanvasNodeHoverToolbar({
 }
 
 export function CanvasNodeInfoModal({ node, open, onClose }: { node: CanvasNodeData | null; open: boolean; onClose: () => void }) {
+    const { message } = App.useApp();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { t } = useTranslation();
     const [view, setView] = useState<"info" | "json">("info");
@@ -256,7 +259,14 @@ export function CanvasNodeInfoModal({ node, open, onClose }: { node: CanvasNodeD
     );
 
     return (
-        <Modal className="canvas-node-info-modal" title={title} open={open && Boolean(node)} centered footer={null} onCancel={onClose}>
+        <Modal className="canvas-node-info-modal" title={title} open={open && Boolean(node)} centered footer={isDesktop() && node?.metadata?.storageKey ? (
+            <Button type="text" icon={<FolderOpen className="size-4" />} onClick={() => {
+                const key = node?.metadata?.storageKey;
+                if (!key) return;
+                void desktopInvoke("desktop_reveal_blob", { namespace: key.startsWith("image:") ? "image_files" : "media_files", key })
+                    .catch((error) => message.error(error instanceof Error ? error.message : String(error)));
+            }}>{t("desktop.storage.reveal")}</Button>
+        ) : null} onCancel={onClose}>
             {node ? (
                 <div className="h-[56vh] min-h-[360px] select-text text-sm" data-canvas-shortcuts-ignore>
                     {view === "info" ? (

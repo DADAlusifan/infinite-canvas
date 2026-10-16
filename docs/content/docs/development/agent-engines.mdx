@@ -1,0 +1,68 @@
+---
+title: Local Agent Engines
+description: Source startup, DSH ownership, engine isolation, and external data boundaries
+---
+
+# Local Agent Engines
+
+The side panel supports Codex and DeepSeek (DSH) through the external Canvas Agent. DSH integration is implemented in repository source; the published npm package may not include these changes. An isolated official Host and local-model fixture have passed integration checks; real-account/model, installation, browser, and desktop acceptance remains pending.
+
+## Run repository source
+
+Prepare Bun and Node.js `^22.19.0 || >=24.0.0`, then run from the repository root:
+
+```bash
+cd canvas-agent
+bun install
+bun run dev
+```
+
+Connect the panel using the local URL and token printed by Canvas Agent. Run the web frontend separately at `http://localhost:23147`. Use `bun run debug` for Canvas Agent diagnostics. DSH dependencies are pinned to `0.2.1-alpha.4`; use repository source when testing this integration.
+
+## DSH ownership and configuration
+
+Selecting DSH starts an owned official Web Host on demand, bound to loopback (`ownedWebHost`). Canvas Agent uses the official profile and Remote APIs. It owns that child process and its descendants; it does not attach to or shut down a separately launched DSH instance. Tauri packaging does not include Canvas Agent, DSH, or Node.
+
+The Host reuses the native DSH home, normally `~/.dsh`, or the existing directory selected by `DSH_HOME`. The panel opens the same Host's official settings page for provider configuration and credentials. A temporary invocation overlay disables extra session logs and telemetry without rewriting the user's DSH configuration. Native settings and session persistence still use the DSH home.
+
+In DSH connection settings, choose **Web configuration** or **Desktop configuration** using **DSH configuration source**; Web is the default. These load the models, plugins, and settings of native `profiles/web` or `profiles/desktop`. Sharing a data home does not merge profiles. The selection is stored in Canvas Agent configuration without copying profile files or credentials. The native settings page edits the currently selected source.
+
+Switching while idle waits for the owned DSH child to exit, starts a background Web Host, and opens a new conversation. Existing history is retained; models, permissions, and Skills are reloaded, and no extra Desktop window opens. Initialization, tasks, approvals, and stop cleanup block switching. A missing profile, incompatible plugin, or startup failure is reported without falling back to another source; users can switch back to an available source. Concurrent native DSH Desktop and real custom-provider calls require separate acceptance.
+
+Models and permission choices come from DSH's native APIs and configuration. A DSH permission decision is separate from the browser's canvas-write confirmation. Startup, authentication, unsupported runtime, and connection failures should stay visible; they must not silently change engines or repeat model requests.
+
+## Engine and Skill isolation
+
+Codex and DSH keep separate model choices, permissions, active sessions, histories, approvals, and selected Skills. Events and requests carry engine/runtime identity in addition to session/turn/item ownership, so late responses cannot populate another engine's conversation. Running work blocks conflicting engine switches and conversation changes.
+
+DSH uses the official `skills.list({ sessionId })` catalog and `/name` invocation. The editable root is the current site workspace's `.dsh/skills`; other catalog sources remain read-only. A native custom provider includes that exact root when nearest-git-root discovery would otherwise select an ancestor repository. Enabling or disabling a managed Skill writes `disable-model-invocation` and `user-invocable`; unknown frontmatter stays intact. Interface fields live in `metadata.infinite-canvas` in `SKILL.md`, and revision checks reject stale writes.
+
+Blank creation opens an editor. Conversation and canvas extraction use an independent temporary DSH session with a restricted preset, no tools, and a tool-call guard. Canvas input and the returned object share Codex's sanitization and validation. Drafts do not change the active conversation or write Skill files; only explicit save writes a document. Temporary sessions are archived on completion, failure, or cancellation, without automatic retry.
+
+## Data and acceptance boundaries
+
+Application complete backups cover application data. They do not include the native DSH home, DSH session history or credentials, external Agent workspaces, or managed Skill files. Preserve those locations separately when moving machines or data directories.
+
+An isolated smoke test has started the real official Host using a temporary `DSH_HOME` and an environment allowlist, without user-home credentials or paid models. It covers IPC, MCP discovery, the Node Cookie/Gateway connection, the model catalog, native session creation/follow/history, PNG attachment retrieval, a canvas tool through a local HTTP fixture, consecutive text turns, cancellation and quiescence, a no-tool draft and archive, and actual owned-process exit. A fake opener also verifies the credential-free native settings URL; it does not verify browser interaction.
+
+Real accounts and model providers, native approval/question handling, reconnection, multi-tab switching, installation, browser/Tauri/WebView2 behavior, and Windows failure scenarios still require the checks in [Pending Tests](/docs/progress/pending-test). No compilation or build was performed.
+
+## Optional isolated native smoke test
+
+The native smoke test is opt-in and is skipped unless `CANVAS_DSH_NATIVE_SMOKE=1`. With dependencies installed, run this PowerShell command from `canvas-agent`:
+
+```powershell
+$previousDshSmoke = $env:CANVAS_DSH_NATIVE_SMOKE
+try {
+    $env:CANVAS_DSH_NATIVE_SMOKE = "1"
+    node --import tsx --test src/agent/dsh/native-smoke.test.ts
+} finally {
+    if ($null -eq $previousDshSmoke) {
+        Remove-Item Env:CANVAS_DSH_NATIVE_SMOKE -ErrorAction SilentlyContinue
+    } else {
+        $env:CANVAS_DSH_NATIVE_SMOKE = $previousDshSmoke
+    }
+}
+```
+
+This starts real local Host processes with temporary data and an in-process `fixture/fixture` adapter. It does not use the user's DSH credentials or call a paid model service.

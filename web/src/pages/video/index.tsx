@@ -1,9 +1,12 @@
+import { isDesktop } from "@/services/desktop/runtime";
+import { startStorageActivity } from "@/services/storage/maintenance";
+import { registerMediaReferences } from "@/services/storage/references";
 import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, LoaderCircle, Plus, SlidersHorizontal, Sparkles, Trash2, Upload, VideoIcon } from "lucide-react";
 import { useEffect, useRef, useState, useSyncExternalStore, type DragEvent } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Input, Modal, Tag, Typography } from "antd";
-import localforage from "localforage";
+import { createStorage } from "@/services/storage/driver";
 import { nanoid } from "nanoid";
-import { saveAs } from "file-saver";
+import { useDownloadFile } from "@/hooks/use-download-file";
 import { useTranslation } from "react-i18next";
 
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
@@ -65,9 +68,10 @@ type GenerationLogConfig = Pick<AiConfig, "model" | "videoModel" | "size" | "vqu
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
 const LOG_STORE_KEY = "infinite-canvas:video_generation_logs";
-const logStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
+const logStore = createStorage("video_generation_logs");
 
 export default function VideoPage() {
+    const downloadFile = useDownloadFile();
     const { message } = App.useApp();
     const { t } = useTranslation();
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
@@ -168,6 +172,8 @@ export default function VideoPage() {
             message.error(t("videoWorkbench.clipboardEmpty"));
         }
     };
+    useEffect(() => registerMediaReferences(() => ({ references, results })), [references, results]);
+
     const generate = async () => {
         const agentTaskId = agentTaskIdRef.current;
         agentTaskIdRef.current = undefined;
@@ -239,7 +245,7 @@ export default function VideoPage() {
     };
 
     const downloadVideo = (video: GeneratedVideo) => {
-        saveAs(video.url, "video.mp4");
+        downloadFile(video.url, "video.mp4");
     };
 
     const saveResultToAssets = (video: GeneratedVideo) => {
@@ -309,6 +315,7 @@ export default function VideoPage() {
 
     const pollGenerationLog = async (log: GenerationLog, configOverride?: AiConfig, agentTaskId?: string) => {
         if (!log.task || activeLogIdsRef.current.has(log.id)) return;
+        const finishActivity = startStorageActivity();
         activeLogIdsRef.current.add(log.id);
         setRunning(true);
         setStartedAt((value) => value || performance.now());
@@ -346,6 +353,7 @@ export default function VideoPage() {
             await saveLog({ ...log, status: "failed", durationMs: Date.now() - log.createdAt, error: errorMessage });
             message.error(errorMessage);
         } finally {
+            finishActivity();
             activeLogIdsRef.current.delete(log.id);
             if (!activeLogIdsRef.current.size) {
                 setRunning(false);
@@ -662,11 +670,12 @@ async function readStoredLogs() {
     if (typeof window === "undefined") return [];
     try {
         const logs: GenerationLog[] = [];
-        await logStore.iterate<GenerationLog, void>((value) => {
+        await logStore.iterate<GenerationLog>((value) => {
             logs.push(value);
         });
         return (await Promise.all(logs.map(normalizeLog))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    } catch {
+    } catch (error) {
+        if (isDesktop()) throw error;
         return [];
     }
 }

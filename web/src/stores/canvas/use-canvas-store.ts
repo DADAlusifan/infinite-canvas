@@ -4,6 +4,8 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { localForageStorage } from "@/lib/localforage-storage";
+import { registerStorageFlusher } from "@/services/storage/maintenance";
+import { isDesktop } from "@/services/desktop/runtime";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
@@ -44,12 +46,27 @@ const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
+let pendingWrite: (() => Promise<void>) | null = null;
+
+async function flushCanvasStorage() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    const write = pendingWrite;
+    if (!write) return;
+    await write();
+    if (pendingWrite === write) pendingWrite = null;
+}
+registerStorageFlusher(flushCanvasStorage, 100);
 
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
         const value = await localForageStorage.getItem(name);
-        if (!value) return null;
+        if (value === null) {
+            const { projects, deletedProjects } = useCanvasStore.getState();
+            queuedPersistState = { projects, deletedProjects };
+            return null;
+        }
         const parsed = JSON.parse(value) as StorageValue<CanvasStore>;
+        if (!parsed?.state || !Array.isArray(parsed.state.projects) || !Array.isArray(parsed.state.deletedProjects)) throw new Error("画布存储结构损坏，已保留原数据");
         queuedPersistState = parsed.state as PersistedCanvasState;
         return parsed;
     },
@@ -57,10 +74,11 @@ const canvasStorage: PersistStorage<CanvasStore> = {
         const nextState = value.state as PersistedCanvasState;
         if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
         queuedPersistState = nextState;
+        pendingWrite = async () => { await localForageStorage.setItem(name, JSON.stringify(value)); };
         if (saveTimer) clearTimeout(saveTimer);
         saveTimer = setTimeout(() => {
             saveTimer = null;
-            void localForageStorage.setItem(name, JSON.stringify(value));
+            void flushCanvasStorage().catch(() => { /* Keep pendingWrite for an explicit retry/close flush. */ });
         }, 400);
     },
     removeItem: (name) => localForageStorage.removeItem(name),
@@ -133,13 +151,14 @@ export const useCanvasStore = create<CanvasStore>()(
         {
             name: CANVAS_STORE_KEY,
             storage: canvasStorage,
+            skipHydration: isDesktop(),
             partialize: (state) =>
                 ({
                     projects: state.projects,
                     deletedProjects: state.deletedProjects,
                 }) as StorageValue<CanvasStore>["state"],
-            onRehydrateStorage: () => () => {
-                useCanvasStore.setState({ hydrated: true });
+            onRehydrateStorage: () => (_state, error) => {
+                if (!error) useCanvasStore.setState({ hydrated: true });
             },
         },
     ),

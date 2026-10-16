@@ -1,3 +1,4 @@
+import { preferences } from "@/services/storage/preferences";
 import { useState, type PointerEvent as ReactPointerEvent } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
@@ -28,7 +29,7 @@ export function AgentPanel() {
             setAgentState({ width: nextWidth });
         };
         const onUp = () => {
-            localStorage.setItem("canvas-agent-panel-width", String(nextWidth));
+            preferences.setItem("canvas-agent-panel-width", String(nextWidth));
             window.removeEventListener("pointermove", onMove);
             window.removeEventListener("pointerup", onUp);
             setResizing(false);

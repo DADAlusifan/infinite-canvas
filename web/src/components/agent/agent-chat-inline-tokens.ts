@@ -1,4 +1,5 @@
 import type { AgentCanvasReference, AgentSkillReference } from "@/stores/use-agent-store";
+import { agentSkillMarker as engineSkillMarker } from "@/lib/agent/agent-engine";
 
 export const agentInlineTokenClass = "mx-0.5 inline-block h-7 whitespace-nowrap rounded-md border px-1.5 align-baseline text-sm leading-[26px]";
 export const agentInlineTokenMediaClass = "mr-1 inline-block size-5 rounded object-cover align-middle";
@@ -9,8 +10,8 @@ export type AgentInlineToken =
     | { type: "skill"; skill: AgentSkillReference }
     | { type: "reference"; reference: AgentCanvasReference };
 
-export function agentSkillMarker(skill: Pick<AgentSkillReference, "name">) {
-    return `$${skill.name}`;
+export function agentSkillMarker(skill: Pick<AgentSkillReference, "name" | "engineId">) {
+    return engineSkillMarker(skill.engineId || "codex", skill.name);
 }
 
 export function agentReferenceMarker(reference: Pick<AgentCanvasReference, "label">) {

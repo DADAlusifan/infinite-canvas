@@ -1,0 +1,83 @@
+---
+title: Windows Desktop
+description: Tauri development, installer configuration, data import, and verification boundaries
+---
+
+# Windows Desktop
+
+The repository includes a Tauri 2 Windows x64 desktop project that reuses the web interface. SQLite holds desktop records and settings; media, previews, and plugin binaries are ordinary indexed files. The web application retains browser storage.
+
+This delivery provides source and installer configuration. Rust compilation, desktop builds, and Windows installation have not been verified. The commands below are for developers to run; see [Pending Tests](/docs/progress/pending-test) for acceptance criteria.
+
+## Development and packaging
+
+Prepare Windows x64, Microsoft Edge WebView2 Runtime, Visual Studio Build Tools with the **Desktop development with C++** workload and Windows SDK, the Rust MSVC toolchain with the `x86_64-pc-windows-msvc` target, and Bun. See the [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows).
+
+From the repository root:
+
+```powershell
+cd web
+bun install
+bun run desktop:dev
+```
+
+Development starts Vite at `http://localhost:23147`. Resolve an existing process occupying that port before starting; do not close a user's browser tabs or change ports to locate their existing data. Development and release builds require separate data directories.
+
+To build the installer:
+
+```powershell
+bun run desktop:build
+```
+
+The script synchronizes the desktop version from the root `VERSION`, builds the frontend and Rust application, and targets `x86_64-pc-windows-msvc`. The usual NSIS output directory is `web/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`; a custom Cargo target directory changes that location.
+
+The installer is configured for the current user and offers Simplified Chinese and English. Installed-app users do not need Bun, Node, Rust, or Vite. Missing WebView2 is handled through its downloadable bootstrapper, which may require an Internet connection. Portable distribution, automatic updates, and a bundled Agent runtime are outside this release.
+
+## Data directories
+
+First launch opens a native folder picker. Select a dedicated empty folder, such as `D:\CanvasData`, or a valid existing desktop data directory. An unavailable directory, damaged database, or unknown format should produce an error without substituting an empty database.
+
+The fixed application identifier is `com.dadalusifan.infinitecanvas`. A small locator in the system configuration directory selects the data root. That root holds `data.sqlite3`, indexed files in `media/`, incomplete writes in `staging/`, the WebView cache in `cache/webview/`, and format/environment markers.
+
+Installation and data locations are separate. Browser IndexedDB does not automatically move into the desktop directory or disappear from the system drive. Windows, WebView2 Runtime, and installer files may still use the system drive. Do not manually rename or move indexed media files.
+
+To change the desktop data root, open **Settings → Local storage → Change data directory** and select one of these modes:
+
+- **Copy to a new empty directory:** copy all business records and managed media, previews, and plugin files, including unreferenced files. The source remains intact; WebView cache and unmanaged files are excluded.
+- **Switch to an existing directory:** open a valid desktop dataset created in the same development/release environment. The application does not merge it with the current dataset; an empty folder is not valid in this mode.
+
+Select the destination through the native folder picker and confirm restarting. The operation flushes pending saves and holds the maintenance lock to block generation and editing. The current directory, parent/child paths, incompatible or damaged data, missing media, and occupied targets are rejected. Cancellation or failure leaves the startup locator unchanged; incomplete targets cannot open as valid datasets. Complete backup/import remains available for transferring data between machines and importing browser data; a separate backup is no longer required just to change the desktop directory.
+
+Directory switching and copying still require Windows acceptance, including file locks, interruption, and restart. Bun behavioral tests and simulations do not replace that verification.
+
+## Import browser data
+
+1. Open the original browser profile and origin holding the data. `localhost:3000`, `localhost:23147`, and `127.0.0.1` have separate storage.
+2. Wait for generation and file operations to finish. In **Settings → Local storage → Complete backup**, export to a local file. Avoid editing from other same-origin tabs during export; a detected source change cancels the output.
+3. In the desktop application, use the complete import control. Select the archive and a new empty directory through native dialogs; the current data directory is not a valid target.
+4. Wait for verification and staging, review the record/file counts and directory, then confirm restarting into the imported data. Switching can be postponed or discarded to choose another directory; imported files are retained. The source browser and previous desktop directory remain intact.
+5. Check projects, assets, histories, providers, model sizes, scripts, and plugins after restarting.
+
+ZIP64 backups stream to the selected file and include all persisted records, preferences, original media, previews, unreferenced media, and plugin private data. Remote-only records keep their URLs without an automatic download. External Agent files, running JavaScript, transient sessions, and in-memory undo history are excluded.
+
+Browser export requires Chrome/Edge database enumeration and local-file writing support; unsupported environments report an error rather than loading the entire library into memory. Missing attachments, damaged archives, unknown formats, content conflicts, insufficient space, and cancellation must preserve existing data. Incomplete staging directories cannot be opened as valid application data.
+
+The archive includes API keys and connection credentials. It is not redacted or encrypted; store it in a location you control. Import/export is local and does not upload the backup automatically. Existing configuration JSON, canvas ZIP, asset ZIP, and WebDAV formats remain separate from the new complete archive.
+
+## Space management
+
+Desktop storage settings show database, media, preview, plugin, and pending-deletion usage, plus directory and file-location actions. Deleting a node, asset, or history record removes its reference; it does not immediately delete desktop media.
+
+Wait for generation/import/synchronization to finish, scan for unused files, review the count and size, then explicitly confirm cleanup. References and the storage revision are checked again; changed data requires another scan. Other projects, assets, histories, plugins, undo history, and active tasks protect their files. Only indexed files are eligible; unknown files are left alone. Externally deleted media is reported as missing and should be restored from a backup.
+
+## Networking and Agent connections
+
+The embedded proxy starts and stops with the application, listens only on loopback, and uses a session credential. Built-in model requests and script `http`, `request`, and injected `fetch` use this path. Explicit `window.fetch`, independent Workers, and WebSockets retain WebView networking behavior.
+
+Desktop proxy settings provide **System proxy** (the default, reading Windows static settings), **Direct**, and **Manual proxy** modes. PAC/WPAD scripts are not executed; an automatic-only system configuration prompts for manual or direct mode. A failed proxy does not silently fall back to direct access. Streaming uploads, SSE, cancellation, redirects, signed URLs, and video ranges still require desktop acceptance tests.
+
+Canvas Agent remains external. Install and start the existing Agent and required CLI yourself, then configure its address and credentials. The desktop installer does not package Node, Codex CLI, or Claude CLI, and does not migrate their workspaces or conversation files.
+
+## Verification boundaries
+
+Implementation uses behavioral Bun tests. Syntax checking, Rust tests, compilation, and builds were not run. Windows install/upgrade, WebView2 input, themes, scaling, drag-and-drop, clipboard, video playback/frame capture, real proxy behavior, and large-file stress scenarios need manual verification. Paid model generation requires separate confirmation; local mocks do not establish provider compatibility.

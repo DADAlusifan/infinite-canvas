@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { DshConfigProfile } from "./agent/engine.js";
 
 export const DEFAULT_PORT = 17371;
 export const CONFIG_DIR = path.join(os.homedir(), ".infinite-canvas");
@@ -11,7 +12,11 @@ export const AGENT_PROMPT = fs.readFileSync(new URL("../agent-instructions.md", 
 const initializedWorkspaces = new Set<string>();
 
 export type SiteWorkspaceConfig = { workspacePath: string; activeThreadId?: string; pinnedThreadIds?: string[] };
-export type CanvasAgentConfig = { url: string; token: string; origins?: string[]; workspace?: SiteWorkspaceConfig };
+export type CanvasAgentConfig = {
+    url: string; token: string; origins?: string[]; workspace?: SiteWorkspaceConfig;
+    activeEngineId?: "codex" | "dsh";
+    dsh?: { home?: string; profile?: DshConfigProfile; activeThreadId?: string };
+};
 
 /** 读取本地 Canvas Agent 配置，不存在时生成默认配置。 */
 export function loadConfig(create = false): CanvasAgentConfig {

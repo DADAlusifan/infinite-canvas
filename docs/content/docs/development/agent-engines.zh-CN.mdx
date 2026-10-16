@@ -1,0 +1,68 @@
+---
+title: 本地 Agent 引擎
+description: 源码启动、DSH 进程归属、引擎隔离和外部数据边界
+---
+
+# 本地 Agent 引擎
+
+侧边栏通过外部 Canvas Agent 连接 Codex 和 DeepSeek（DSH）。DSH 接入已加入仓库源码，已发布的 npm 包不代表包含这些改动；隔离环境中的官方 Host 与本地模型样例已通过联调，真实账号/模型、安装、浏览器和桌面仍待验收。
+
+## 从本仓库启动
+
+准备 Bun 与 Node.js `^22.19.0 || >=24.0.0`，从仓库根目录执行：
+
+```bash
+cd canvas-agent
+bun install
+bun run dev
+```
+
+在面板填入 Canvas Agent 输出的本机地址和 token。网页前端另行启动，默认地址为 `http://localhost:23147`。排查 Canvas Agent 问题时使用 `bun run debug`。DSH 依赖固定为 `0.2.1-alpha.4`，验收本次接入时使用仓库源码。
+
+## DSH 进程与配置
+
+选择 DSH 后，Canvas Agent 按需启动自己拥有的官方 Web Host，仅监听本机回环地址（`ownedWebHost`），使用官方 profile 和 Remote API。Canvas Agent 负责收尾该子进程及其后代，不接管或关闭用户另行启动的 DSH 实例。Tauri 安装包暂不内置 Canvas Agent、DSH 或 Node。
+
+Host 复用原生 DSH 数据目录，默认为 `~/.dsh`，也可通过 `DSH_HOME` 指向已有目录。面板中的配置入口打开同一 Host 的官方设置页，渠道和凭据按 DSH 原生方式管理。本次启动使用临时覆盖关闭额外会话日志与遥测，不改写用户的 DSH 配置；原生设置和会话仍保存在 DSH 数据目录。
+
+在侧栏的 DSH 连接设置中，使用「DSH 配置来源」选择 **Web 配置**或 **Desktop 配置**，默认 Web。两者分别加载原生 `profiles/web`、`profiles/desktop` 的模型、插件与设置；共用数据根目录不会自动合并两个 profile。选择保存在 Canvas Agent 配置中，不复制配置或凭据。打开「管理 DSH 设置」时，原生设置编辑的是当前所选来源。
+
+空闲时切换来源会等待画布托管的旧 DSH 退出，再启动后台 Web Host 并新建对话；原有历史保留，模型、权限和技能重新读取，不额外打开 Desktop 窗口。初始化、任务、审批及停止收尾期间禁止切换。目标 profile 缺失、插件不兼容或启动失败会明确报错，不回退另一来源；仍可切换回可用来源。原生 DSH Desktop 的并行运行和真实自定义模型调用需单独验收。
+
+模型和权限选择来自 DSH 原生接口及配置。DSH 的权限决定与浏览器侧的画布写操作确认分别生效。启动、鉴权、运行时版本或连接失败应直接显示，不应静默切换引擎或重复提交模型请求。
+
+## 引擎与 Skill 隔离
+
+Codex、DSH 分别维护模型、权限、活动会话、历史、审批和所选 Skill。请求与事件除会话、turn、item 归属外，还携带引擎与运行实例身份，迟到响应不得进入另一个引擎的对话；运行中的任务应阻止冲突的引擎切换和会话变更。
+
+DSH 使用官方 `skills.list({ sessionId })` 发现技能，以 `/name` 调用。当前站点工作空间下的 `.dsh/skills` 允许编辑，其它原生来源只读。官方发现逻辑以最近 Git 根目录为准，接入会通过原生自定义 provider 纳入当前站点的固定目录。启停受管技能时写入 `disable-model-invocation`、`user-invocable`，保留未知 frontmatter；显示名称、短说明和默认提示词放在 `SKILL.md` 的 `metadata.infinite-canvas`，revision 不匹配时拒绝覆盖。
+
+空白新建直接打开编辑器；从对话或画布提炼时使用独立临时 DSH 会话，限制 preset、清空工具并设置工具调用 guard。画布输入和草稿结果复用 Codex 的脱敏与校验。草稿不得修改当前对话或写入 Skill 文件，只有明确保存才写入文档；完成、失败或取消后归档临时会话，不自动重试。
+
+## 数据与验收边界
+
+应用「完整备份」只包含应用数据，不包含原生 DSH 数据目录、DSH 会话历史和凭据、外部 Agent 工作空间及受管 Skill 文件。迁移电脑或数据目录时，需要单独保留这些外部位置。
+
+隔离冒烟已使用临时 `DSH_HOME` 和环境变量白名单启动真实官方 Host，未读取用户原生目录中的凭据，也未调用付费模型。已覆盖 IPC、MCP 发现、Node Cookie/Gateway 连接、模型目录、原生会话创建/follow/历史、PNG 附件回读、画布工具经本地 HTTP 样例回传、连续文本、取消与 quiesce、无工具草稿及归档，以及实际 owned 进程退出。无凭据设置入口通过注入的假 opener 校验地址，未验收浏览器中的真实操作。
+
+真实账号和模型服务、原生审批与追问、断线恢复、多标签页切换、安装、浏览器/Tauri/WebView2 及真实 Windows 异常场景，仍需按[待测试](/zh-CN/docs/progress/pending-test)验收。本次未执行编译或构建。
+
+## 可选的隔离原生冒烟
+
+原生冒烟默认跳过，仅在 `CANVAS_DSH_NATIVE_SMOKE=1` 时执行。安装依赖后，在 `canvas-agent` 目录运行以下 PowerShell 命令：
+
+```powershell
+$previousDshSmoke = $env:CANVAS_DSH_NATIVE_SMOKE
+try {
+    $env:CANVAS_DSH_NATIVE_SMOKE = "1"
+    node --import tsx --test src/agent/dsh/native-smoke.test.ts
+} finally {
+    if ($null -eq $previousDshSmoke) {
+        Remove-Item Env:CANVAS_DSH_NATIVE_SMOKE -ErrorAction SilentlyContinue
+    } else {
+        $env:CANVAS_DSH_NATIVE_SMOKE = $previousDshSmoke
+    }
+}
+```
+
+该测试启动真实本机 Host，使用临时数据和进程内的 `fixture/fixture` 模型适配器，不使用用户的 DSH 凭据，不请求付费模型服务。

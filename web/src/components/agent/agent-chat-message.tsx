@@ -118,7 +118,7 @@ export function AgentChatMessage({ item, theme, onRejectTool, onApproveTool }: {
     }
     if (item.role === "tool") {
         if (objectField(item.detail, "status") === "pending") return <AgentPendingToolCard summary={item.text} detail={item.detail} theme={theme} onReject={() => onRejectTool?.(item.id)} onApprove={() => onApproveTool?.(item.id)} />;
-        return <AgentToolCard title={item.title || tr("toolCall")} text={item.text} detail={item.detail} theme={theme} />;
+        return <><AgentToolCard title={item.title || tr("toolCall")} text={item.text} detail={item.detail} theme={theme} />{item.attachments?.length ? <AgentMessageAttachments attachments={item.attachments} /> : null}</>;
     }
     return (
         <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
@@ -214,12 +214,14 @@ export function AgentPendingToolCard({ summary, detail, theme, onReject, onAppro
     );
 }
 
-export function AgentApprovalCard({ approval, theme, onDecision }: { approval: AgentPendingApproval; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; onDecision: (decision: "accept" | "acceptForSession" | "decline") => void }) {
+export function AgentApprovalCard({ approval, theme, onDecision }: { approval: AgentPendingApproval; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; onDecision: (decision: string) => void }) {
     const { t } = useTranslation();
+    const engineId = useAgentStore((state) => state.engineId);
+    const decisions = approval.decisions || (engineId === "codex" ? [{ value: "decline", label: t("agent.message.decline") }, { value: "accept", label: t("agent.message.allowOnce") }, { value: "acceptForSession", label: t("agent.message.allowSession") }] : []);
     const isFile = approval.method === "item/fileChange/requestApproval";
     const isNetwork = Boolean(approval.networkApprovalContext);
     const title = t(isNetwork ? "agent.message.networkApproval" : isFile ? "agent.message.fileApproval" : approval.method === "item/permissions/requestApproval" ? "agent.message.permissionApproval" : "agent.message.commandApproval");
-    const target = isNetwork ? approvalTarget(approval.networkApprovalContext) : isFile ? approval.grantRoot || approval.cwd : commandText(approval.command) || approval.cwd;
+    const target = approval.toolName || (isNetwork ? approvalTarget(approval.networkApprovalContext) : isFile ? approval.grantRoot || approval.cwd : commandText(approval.command) || approval.cwd);
     return (
         <div className="min-w-0 rounded-xl border px-3 py-3" style={{ borderColor: "rgba(234,88,12,.32)", background: "rgba(234,88,12,.035)", color: theme.node.text }}>
             <div className="flex items-start gap-2.5">
@@ -231,9 +233,7 @@ export function AgentApprovalCard({ approval, theme, onDecision }: { approval: A
                 </div>
             </div>
             <div className="mt-3 flex flex-wrap justify-end gap-1.5 border-t pt-3" style={{ borderColor: theme.node.stroke }}>
-                <Button danger type="text" className="!h-8" disabled={Boolean(approval.deciding)} loading={approval.deciding === "decline"} onClick={() => onDecision("decline")}>{t("agent.message.decline")}</Button>
-                <Button type="text" className="!h-8" disabled={Boolean(approval.deciding)} loading={approval.deciding === "accept"} onClick={() => onDecision("accept")}>{t("agent.message.allowOnce")}</Button>
-                <Button type="text" className="!h-8" disabled={Boolean(approval.deciding)} loading={approval.deciding === "acceptForSession"} style={{ color: "#ea580c" }} onClick={() => onDecision("acceptForSession")}>{t("agent.message.allowSession")}</Button>
+                {decisions.map((decision) => <Button key={decision.value} danger={decision.value === "decline" || decision.value === "rejected"} type="text" className="!h-8" disabled={Boolean(approval.deciding)} loading={approval.deciding === decision.value} onClick={() => onDecision(decision.value)}>{decision.label}</Button>)}
             </div>
         </div>
     );

@@ -6,6 +6,8 @@ import { useTranslation } from "react-i18next";
 import { useCopyText } from "@/hooks/use-copy-text";
 import { testLocalProxy } from "@/services/api/local-proxy";
 import { DEFAULT_LOCAL_PROXY_URL, LOCAL_PROXY_PACKAGE, normalizeLocalProxyUrl, useConfigStore } from "@/stores/use-config-store";
+import { isDesktop } from "@/services/desktop/runtime";
+import { ConfigDesktopNetwork } from "./config-desktop-network";
 
 export function ConfigLocalProxy() {
     const { message } = App.useApp();
@@ -27,6 +29,7 @@ export function ConfigLocalProxy() {
         }
     };
 
+    if (isDesktop()) return <ConfigDesktopNetwork />;
     return (
         <Form layout="vertical" requiredMark={false}>
             <section className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">

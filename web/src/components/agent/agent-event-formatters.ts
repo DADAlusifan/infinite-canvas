@@ -5,6 +5,7 @@ import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-refer
 import { randomId } from "@/lib/utils";
 import { resolveAgentMessageAssetUrl } from "@/services/api/canvas-agent";
 import { useAgentStore, type AgentAttachment, type AgentChatItem, type AgentEventLog, type AgentMessageAttachment, type AgentTokenUsage } from "@/stores/use-agent-store";
+import { getAgentScope } from "@/lib/agent/agent-engine";
 import type { AgentChatAttachment } from "./agent-chat-message";
 export const REASONING_PLACEHOLDER = i18n.t("agent.events.analyzing");
 
@@ -248,7 +249,7 @@ export function registerLiveAgentTurn(
     const threadId = event.threadId || event.thread_id || "";
     const turnId = event.turnId || event.turn_id || "";
     const key = threadId && turnId ? `${threadId}\0${turnId}` : "";
-    if (event.replayed && key && authoritativeTurns.has(key)) return false;
+    if (key && authoritativeTurns.has(key)) return false;
     if (key) liveTurns.add(key);
     return true;
 }
@@ -525,8 +526,9 @@ export function scopeChatItem(item: AgentChatItem, threadId: string, turnId: str
     const scopeTurnId = turnId || "pending";
     const prefix = `${threadId || "local"}:${scopeTurnId}:`;
     const sourceItemId = item.itemId || (item.id.startsWith(prefix) ? item.id.slice(prefix.length) : item.id);
-    const itemId = item.role === "user" ? "synthetic:user" : sourceItemId;
-    return { ...item, id: agentMessageId(threadId || "local", scopeTurnId, itemId), itemId, threadId, turnId };
+    const scope = getAgentScope();
+    const itemId = item.role === "user" && scope.engineId === "codex" ? "synthetic:user" : sourceItemId;
+    return { ...item, engineId: scope.engineId, runtimeId: scope.runtimeId, skill: item.skill ? { ...item.skill, engineId: scope.engineId } : undefined, id: agentMessageId(threadId || "local", scopeTurnId, itemId), itemId, threadId, turnId };
 }
 
 export function bindPendingTurnMessages(messages: AgentChatItem[], threadId: string, turnId: string) {
@@ -562,7 +564,7 @@ export function mergeAgentMessages(snapshot: AgentChatItem[], current: AgentChat
 
 export function normalizeHistoryMessages(messages: AgentChatItem[]) {
     return messages
-        .filter((item) => (normalizeText(item.text) || item.role === "tool") && item.itemId && item.threadId && item.turnId)
+        .filter((item) => (normalizeText(item.text) || item.role === "tool" || item.attachments?.length) && item.itemId && item.threadId && item.turnId)
         .map(({ streamId: _streamId, ...item }) => scopeChatItem({ ...item, text: normalizeText(item.text) } as AgentChatItem, item.threadId!, item.turnId!));
 }
 

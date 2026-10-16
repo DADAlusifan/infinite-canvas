@@ -1,30 +1,41 @@
-import localforage from "localforage";
+import { startStorageActivity } from "@/services/storage/maintenance";
+import { createStorage } from "@/services/storage/driver";
+import { desktopBlobUrl, isDesktop } from "@/services/desktop/runtime";
 import { nanoid } from "nanoid";
 
 import { withLocalProxy } from "@/stores/use-config-store";
 
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
 
-const store = localforage.createInstance({ name: "infinite-canvas", storeName: "media_files" });
+const store = createStorage("media_files");
 const objectUrls = new Map<string, string>();
 
 export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
-    const blob = typeof input === "string" ? await (await fetch(withLocalProxy(input))).blob() : input;
-    const storageKey = `${prefix}:${nanoid()}`;
-    await store.setItem(storageKey, blob);
-    const url = URL.createObjectURL(blob);
-    objectUrls.set(storageKey, url);
-    const meta = blob.type.startsWith("video/") ? await readVideoMeta(url) : blob.type.startsWith("audio/") ? await readAudioMeta(url) : {};
-    return { url, storageKey, bytes: blob.size, mimeType: blob.type || "application/octet-stream", ...meta };
+    const finishActivity = startStorageActivity();
+    try {
+        let blob: Blob;
+        if (typeof input === "string") {
+            const response = await fetch(withLocalProxy(input));
+            if (!response.ok) throw new Error(`媒体下载失败（${response.status}）`);
+            blob = await response.blob();
+        } else blob = input;
+        const storageKey = `${prefix}:${nanoid()}`;
+        await store.setItem(storageKey, blob);
+        const url = isDesktop() ? desktopBlobUrl("media_files", storageKey) : URL.createObjectURL(blob);
+        objectUrls.set(storageKey, url);
+        const meta = blob.type.startsWith("video/") ? await readVideoMeta(url) : blob.type.startsWith("audio/") ? await readAudioMeta(url) : {};
+        return { url, storageKey, bytes: blob.size, mimeType: blob.type || "application/octet-stream", ...meta };
+    } finally { finishActivity(); }
 }
 
 export async function resolveMediaUrl(storageKey?: string, fallback = "") {
     if (!storageKey) return fallback;
+    if (isDesktop()) return desktopBlobUrl("media_files", storageKey);
     const cached = objectUrls.get(storageKey);
     if (cached) return cached;
     const blob = await store.getItem<Blob>(storageKey);
     if (!blob) return fallback;
-    const url = URL.createObjectURL(blob);
+    const url = isDesktop() ? desktopBlobUrl("media_files", storageKey) : URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
     return url;
 }
@@ -35,12 +46,13 @@ export async function getMediaBlob(storageKey: string) {
 
 export async function setMediaBlob(storageKey: string, blob: Blob) {
     await store.setItem(storageKey, blob);
-    const url = URL.createObjectURL(blob);
+    const url = isDesktop() ? desktopBlobUrl("media_files", storageKey) : URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
     return url;
 }
 
 export async function deleteStoredMedia(keys: Iterable<string>) {
+    if (isDesktop()) return;
     await Promise.all(
         Array.from(new Set(keys)).map(async (key) => {
             const url = objectUrls.get(key);
@@ -52,6 +64,7 @@ export async function deleteStoredMedia(keys: Iterable<string>) {
 }
 
 export async function cleanupUnusedMedia(usedData: unknown) {
+    if (isDesktop()) return;
     const usedKeys = collectMediaStorageKeys(usedData);
     const unused: string[] = [];
     await store.iterate((_value, key) => {

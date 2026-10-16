@@ -1,4 +1,6 @@
+import { enDesktop } from "./desktop";
 export default {
+    desktop: enDesktop,
     meta: {
         title: "Infinite Canvas",
         description: "An infinite canvas creation tool",

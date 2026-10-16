@@ -1,7 +1,9 @@
+import { nanoid } from "nanoid";
+import { flushStorage, withStorageActivity } from "@/services/storage/maintenance";
 import { Copy, Download, PencilLine, Search, Trash2, Upload } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { App, Button, Card, Drawer, Empty, Form, Image, Input, Modal, Pagination, Select, Space, Tag, Typography } from "antd";
-import { saveAs } from "file-saver";
+import { saveFile } from "@/services/desktop/files";
 import { useTranslation } from "react-i18next";
 
 import { useCopyText } from "@/hooks/use-copy-text";
@@ -153,7 +155,7 @@ export default function AssetsPage() {
                 return;
             }
             const ext = asset.data.mimeType?.split("/")[1]?.split("+")[0] || (asset.kind === "video" ? "mp4" : "png");
-            saveAs(blob, `${asset.title || "asset"}.${ext}`);
+            await saveFile(blob, `${asset.title || "asset"}.${ext}`);
         } catch {
             message.error(t("assets.downloadFailed"));
         }
@@ -170,17 +172,16 @@ export default function AssetsPage() {
     const importAssetZip = async (file?: File) => {
         if (!file) return;
         try {
-            const importedAssets = await readAssetPackage(file);
-            importedAssets.forEach((asset) => {
-                const payload = { ...asset } as Record<string, unknown>;
-                delete payload.id;
-                delete payload.createdAt;
-                delete payload.updatedAt;
-                addAsset(payload as Parameters<typeof addAsset>[0]);
+            await withStorageActivity(async () => {
+                const importedAssets = await readAssetPackage(file);
+                const now = new Date().toISOString();
+                const store = useAssetStore.getState();
+                store.replaceAssets([...importedAssets.map((asset) => ({ ...asset, id: nanoid(), createdAt: now, updatedAt: now })), ...store.assets]);
+                await flushStorage();
+                message.success(t("assets.imported", { count: importedAssets.length }));
             });
-            message.success(t("assets.imported", { count: importedAssets.length }));
-        } catch {
-            message.error(t("assets.importFailed"));
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : t("assets.importFailed"));
         } finally {
             if (assetInputRef.current) assetInputRef.current.value = "";
         }

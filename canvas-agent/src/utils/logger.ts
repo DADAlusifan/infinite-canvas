@@ -6,6 +6,7 @@ import {inspect} from "node:util";
 import winston, {format, transports, type Logger as WinstonLogger} from "winston";
 
 import {formatDateForFilename} from "./date.js";
+import {redactAgentLog} from "./agent-runtime.js";
 
 /** 管理 Canvas Agent 的终端与文件 Debug 日志。 */
 export class Logger {
@@ -62,9 +63,10 @@ function formatDetails(details: unknown) {
 
 /** 清理日志内容中的敏感数据和不可序列化引用。 */
 function sanitize(value: unknown, key = "", seen = new WeakSet<object>()): unknown {
-    if (/token|authorization|api.?key|dataurl/i.test(key)) return "[REDACTED]";
+    if (/token|authorization|api.?key|dataurl|cookie/i.test(key)) return "[REDACTED]";
     if (typeof value === "string" && value.startsWith("data:")) return `[DATA URL ${value.length} chars]`;
-    if (value instanceof Error) return {name: value.name, message: value.message, stack: value.stack};
+    if (typeof value === "string") return redactAgentLog(value);
+    if (value instanceof Error) return {name: value.name, message: redactAgentLog(value.message), stack: value.stack ? redactAgentLog(value.stack) : undefined};
     if (!value || typeof value !== "object") return value;
     if (seen.has(value)) return "[CIRCULAR]";
     seen.add(value);

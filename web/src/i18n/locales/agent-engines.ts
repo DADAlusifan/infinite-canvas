@@ -1,0 +1,14 @@
+export const agentEngineTranslations = {
+    "zh-CN": {
+        configProfile: "DSH 配置来源", webProfile: "Web 配置", desktopProfile: "Desktop 配置", configProfileDescription: "切换后本地 Agent 会在后台重启 DSH 并新建对话，历史记录保留，不会额外打开 Desktop 窗口。", configProfileFailed: "切换 DSH 配置来源失败",
+        connectFirst: "请先连接本地 Agent，再选择引擎", initializing: "{{engine}} 正在初始化，完成后可切换引擎。",
+        select: "选择引擎", switching: "正在切换引擎", busy: "当前引擎仍在处理任务，请完成后再操作", running: "{{engine}} 正在运行", waitingApproval: "等待 {{engine}} 确认权限", placeholder: "询问 {{engine}}，输入 / 使用技能，@ 引用画布素材", initFailed: "对话初始化失败，请检查引擎设置，或新建/恢复对话", agentNotFound: "没有发现本地 Agent，请先在本项目中启动 Canvas Agent", switchFailed: "切换引擎失败", catalogFailed: "读取引擎列表失败", identifierExtra: "用于文件夹名和 {{marker}} 调用。", defaultPromptExtra: "填写时必须准确包含 {{marker}}。", whenToUseExtra: "说明这个技能的能力和适用场景，当前引擎会据此判断是否调用。",
+        settings: "管理 DSH 设置", settingsFailed: "无法打开 DSH 设置", defaultPromptMention: "默认提示词必须包含 {{marker}}", localTitle: "启动本项目的本地 Agent", localDescription: "在项目根目录运行以下命令，连接后可选择 Codex 或 DSH。两种引擎的模型、认证和历史由各自原生运行时管理。", connectDescription: "连接本项目的本地 Agent，在同一侧栏中使用 Codex 或 DSH。",
+    },
+    "en-US": {
+        configProfile: "DSH configuration source", webProfile: "Web configuration", desktopProfile: "Desktop configuration", configProfileDescription: "The local Agent restarts DSH in the background and starts a new conversation. History is preserved and no extra Desktop window opens.", configProfileFailed: "Failed to switch DSH configuration source",
+        connectFirst: "Connect the local Agent before selecting an engine", initializing: "{{engine}} is initializing. You can switch engines when it finishes.",
+        select: "Select engine", switching: "Switching engine", busy: "The current engine is still processing a task", running: "{{engine}} is running", waitingApproval: "Waiting for {{engine}} to confirm permissions", placeholder: "Ask {{engine}}, / for skills, @ for canvas resources", initFailed: "Conversation initialization failed. Check engine settings or create/resume a conversation", agentNotFound: "Local Agent not found. Start Canvas Agent from this project first", switchFailed: "Failed to switch engine", catalogFailed: "Failed to load engines", identifierExtra: "Used for the folder name and {{marker}} invocation.", defaultPromptExtra: "Must include the exact marker {{marker}} when provided.", whenToUseExtra: "Describe the skill's capabilities and use cases for the current engine.",
+        settings: "Manage DSH settings", settingsFailed: "Unable to open DSH settings", defaultPromptMention: "The default prompt must contain {{marker}}", localTitle: "Start this project's local Agent", localDescription: "Run this command from the project root, then connect and select Codex or DSH. Each native runtime manages its own models, authentication and history.", connectDescription: "Connect this project's local Agent to use Codex or DSH in this sidebar.",
+    },
+};

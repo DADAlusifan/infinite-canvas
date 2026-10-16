@@ -132,6 +132,8 @@ bun install
 bun run dev
 ```
 
+Windows Tauri 桌面工程、安装配置与浏览器数据迁入步骤见 [桌面版开发说明](docs/content/docs/development/desktop.zh-CN.mdx)，桌面运行及安装仍待人工验收。
+
 ### Docker 运行
 
 ```bash

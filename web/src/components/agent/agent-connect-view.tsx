@@ -1,10 +1,12 @@
 import { Fragment } from "react";
-import { App, Button, Input, Tooltip } from "antd";
+import { App, Button, Input, Select, Tooltip } from "antd";
 import copyToClipboard from "copy-to-clipboard";
 import { Copy, KeyRound, Link2, PlugZap } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
+import { agentIsBusy, type DshConfigProfile } from "@/lib/agent/agent-engine";
+import { useAgentStore } from "@/stores/use-agent-store";
 
 const AGENT_PLUGIN_REMOVE_COMMAND = "codex plugin remove infinite-canvas";
 const AGENT_MCP_REMOVE_COMMAND = "codex mcp remove infinite-canvas";
@@ -20,6 +22,7 @@ export function AgentConnectView({
     onUrlChange,
     onTokenChange,
     onToggleEnabled,
+    onConfigProfileChange,
 }: {
     theme: (typeof canvasThemes)[keyof typeof canvasThemes];
     url: string;
@@ -31,12 +34,20 @@ export function AgentConnectView({
     onUrlChange: (value: string) => void;
     onTokenChange: (value: string) => void;
     onToggleEnabled: () => void;
+    onConfigProfileChange: (profile: DshConfigProfile) => void;
 }) {
     const { t } = useTranslation();
     const { message } = App.useApp();
-    const steps = [{ title: t("agent.connect.pluginTitle"), text: t("agent.connect.pluginText") }, { title: t("agent.connect.directTitle"), text: t("agent.connect.directText"), command: "npx -y @basketikun/canvas-agent@latest" }];
-    const statusText = connectError ? t("agent.status.failed") : connected ? activity : enabled ? t("agent.status.connecting") : t("agent.status.disconnected");
-    const statusColor = connectError ? "#dc2626" : connected ? "#16a34a" : enabled ? "#d97706" : theme.node.muted;
+    const engineId = useAgentStore((state) => state.engineId);
+    const engineName = useAgentStore((state) => state.engines.find((engine) => engine.id === state.engineId)?.name || (state.engineId === "dsh" ? "DSH" : "Codex"));
+    const conversation = useAgentStore((state) => state.conversation);
+    const configProfile = useAgentStore((state) => state.engines.find((engine) => engine.id === "dsh")?.configProfile);
+    const engineBusy = useAgentStore(agentIsBusy);
+    const switchingEngine = useAgentStore((state) => state.switchingEngine);
+    const steps = [{ title: t("agentEngines.localTitle"), text: t("agentEngines.localDescription"), command: "npm --prefix canvas-agent run dev" }];
+    const connectionFailed = Boolean(connectError || connected && conversation.status === "failed");
+    const statusText = connectionFailed ? t("agent.status.failed") : connected ? activity : enabled ? t("agent.status.connecting") : t("agent.status.disconnected");
+    const statusColor = connectionFailed ? "#dc2626" : connected ? "#16a34a" : enabled ? "#d97706" : theme.node.muted;
     const copyCommand = (command: string) => {
         copyToClipboard(command);
         message.success(t("agent.connect.commandCopied"));
@@ -71,7 +82,7 @@ export function AgentConnectView({
                 <div>
                     <div className="text-base font-semibold leading-6">{t("agent.connect.title")}</div>
                     <div className="mt-1 text-xs leading-5" style={{ color: theme.node.muted }}>
-                        {t("agent.connect.description")}
+                        {t("agentEngines.connectDescription")}
                     </div>
                 </div>
                 <div className="space-y-2">
@@ -93,7 +104,7 @@ export function AgentConnectView({
                                         </div>
                                     ) : null}
                                 </div>
-                                {index === 0 ? codexPluginReminder : null}
+                                {index === 0 && engineId === "codex" ? codexPluginReminder : null}
                             </Fragment>
                         );
                     })}
@@ -114,12 +125,29 @@ export function AgentConnectView({
                             <div className="mt-1 text-xs leading-5" style={{ color: theme.node.muted }}>
                                 {t("agent.connect.autoDiscover")}
                             </div>
+                            {connected && conversation.status === "preparing" ? <div role="status" className="mt-1 text-xs leading-5" style={{ color: theme.node.muted }}>{t("agentEngines.initializing", { engine: engineName })}</div> : null}
+                            {connected && conversation.status === "failed" ? <div role="alert" className="mt-1 text-xs leading-5" style={{ color: statusColor }}>{conversation.error || t("agentEngines.initFailed")}</div> : null}
                         </div>
                         <Button className="!h-8 !px-3" type={enabled ? "default" : "primary"} icon={<PlugZap className="size-4" />} onClick={onToggleEnabled}>
                             {t(enabled ? "agent.connect.disconnect" : "agent.connect.connect")}
                         </Button>
                     </div>
                     <div className="mt-3 grid gap-2.5">
+                        {engineId === "dsh" ? (
+                            <div className="grid gap-1.5">
+                                <label htmlFor="dsh-config-profile" className="text-xs font-medium" style={{ color: theme.node.muted }}>{t("agentEngines.configProfile")}</label>
+                                <Select<DshConfigProfile>
+                                    id="dsh-config-profile"
+                                    aria-label={t("agentEngines.configProfile")}
+                                    value={configProfile}
+                                    disabled={!connected || engineBusy || !configProfile}
+                                    loading={switchingEngine}
+                                    options={[{ value: "web", label: t("agentEngines.webProfile") }, { value: "desktop", label: t("agentEngines.desktopProfile") }]}
+                                    onChange={onConfigProfileChange}
+                                />
+                                <div className="text-xs leading-5" style={{ color: theme.node.muted }}>{t("agentEngines.configProfileDescription")}</div>
+                            </div>
+                        ) : null}
                         <label className="grid gap-1.5">
                             <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: theme.node.muted }}>
                                 <Link2 className="size-3.5" />

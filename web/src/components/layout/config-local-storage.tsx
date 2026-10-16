@@ -5,6 +5,9 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { readLocalStorageUsage, type LocalStorageUsage } from "@/services/local-storage-usage";
+import { isDesktop } from "@/services/desktop/runtime";
+import { ConfigDesktopStorage } from "./config-desktop-storage";
+import { StorageBackupControls } from "./storage-backup-controls";
 
 const storeLabelKeys: Record<string, string> = {
     app_state: "appState",
@@ -36,14 +39,16 @@ export function ConfigLocalStorage({ active }: { active: boolean }) {
     }, [t]);
 
     useEffect(() => {
-        if (active && !usage) void refresh();
+        if (!isDesktop() && active && !usage) void refresh();
     }, [active, refresh, usage]);
 
     const indexedDbBytes = usage?.contentBytes ?? 0;
     const percent = usage?.quota ? Math.min(100, (usage.usage / usage.quota) * 100) : 0;
+    if (isDesktop()) return <ConfigDesktopStorage active={active} />;
 
     return (
         <div className="space-y-3">
+            <StorageBackupControls />
             <section className="rounded-lg border border-stone-200 p-4 dark:border-stone-800">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>

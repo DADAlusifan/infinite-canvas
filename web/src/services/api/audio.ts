@@ -1,3 +1,4 @@
+import { startStorageActivity } from "@/services/storage/maintenance";
 import axios from "axios";
 
 import i18n from "@/i18n";
@@ -21,49 +22,52 @@ function aiHeaders(config: AiConfig) {
 }
 
 export async function requestAudioGeneration(config: AiConfig, prompt: string, options?: RequestOptions): Promise<Blob> {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.audioModel);
-    const model = requestConfig.model.trim();
-    const format = normalizeAudioFormatValue(config.audioFormat);
-    const script = resolveModelScript(config, config.model || config.audioModel);
-    if (script) {
-        if (!model) throw new Error(apiText("audioModelRequired"));
-        if (!requestConfig.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
-        if (!requestConfig.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
+    const finishActivity = startStorageActivity();
+    try {
+        const requestConfig = resolveModelRequestConfig(config, config.model || config.audioModel);
+        const model = requestConfig.model.trim();
+        const format = normalizeAudioFormatValue(config.audioFormat);
+        const script = resolveModelScript(config, config.model || config.audioModel);
+        if (script) {
+            if (!model) throw new Error(apiText("audioModelRequired"));
+            if (!requestConfig.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
+            if (!requestConfig.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
+            try {
+                const result = await runModelPlugin({
+                    capability: "audio",
+                    script,
+                    config: requestConfig,
+                    prompt,
+                    params: { voice: normalizeAudioVoiceValue(config.audioVoice), format, speed: normalizeAudioSpeedValue(config.audioSpeed), instructions: config.audioInstructions.trim() },
+                    signal: options?.signal,
+                });
+                return await audioPluginBlob(result, format);
+            } catch (error) {
+                throw new Error(readAxiosError(error, apiText("audioGenerationFailed")));
+            }
+        }
+        assertAudioConfig(requestConfig, model);
+        const instructions = config.audioInstructions.trim();
+
         try {
-            const result = await runModelPlugin({
-                capability: "audio",
-                script,
-                config: requestConfig,
-                prompt,
-                params: { voice: normalizeAudioVoiceValue(config.audioVoice), format, speed: normalizeAudioSpeedValue(config.audioSpeed), instructions: config.audioInstructions.trim() },
-                signal: options?.signal,
-            });
-            return await audioPluginBlob(result, format);
+            const response = await axios.post<Blob>(
+                aiApiUrl(requestConfig, "/audio/speech"),
+                {
+                    model,
+                    input: prompt,
+                    voice: normalizeAudioVoiceValue(config.audioVoice),
+                    response_format: format,
+                    speed: Number(normalizeAudioSpeedValue(config.audioSpeed)),
+                    ...(instructions ? { instructions } : {}),
+                },
+                { headers: aiHeaders(requestConfig), responseType: "blob", signal: options?.signal },
+            );
+            await assertAudioBlob(response.data);
+            return response.data.type.startsWith("audio/") ? response.data : new Blob([response.data], { type: audioMimeType(format) });
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("audioGenerationFailed")));
         }
-    }
-    assertAudioConfig(requestConfig, model);
-    const instructions = config.audioInstructions.trim();
-
-    try {
-        const response = await axios.post<Blob>(
-            aiApiUrl(requestConfig, "/audio/speech"),
-            {
-                model,
-                input: prompt,
-                voice: normalizeAudioVoiceValue(config.audioVoice),
-                response_format: format,
-                speed: Number(normalizeAudioSpeedValue(config.audioSpeed)),
-                ...(instructions ? { instructions } : {}),
-            },
-            { headers: aiHeaders(requestConfig), responseType: "blob", signal: options?.signal },
-        );
-        await assertAudioBlob(response.data);
-        return response.data.type.startsWith("audio/") ? response.data : new Blob([response.data], { type: audioMimeType(format) });
-    } catch (error) {
-        throw new Error(readAxiosError(error, apiText("audioGenerationFailed")));
-    }
+    } finally { finishActivity(); }
 }
 
 async function audioPluginBlob(result: unknown, format: string): Promise<Blob> {
@@ -81,8 +85,11 @@ async function audioPluginBlob(result: unknown, format: string): Promise<Blob> {
 }
 
 export async function storeGeneratedAudio(blob: Blob, format = "mp3"): Promise<UploadedFile> {
-    const audio = blob.type.startsWith("audio/") ? blob : new Blob([blob], { type: audioMimeType(format) });
-    return uploadMediaFile(audio, "audio");
+    const finishActivity = startStorageActivity();
+    try {
+        const audio = blob.type.startsWith("audio/") ? blob : new Blob([blob], { type: audioMimeType(format) });
+        return await uploadMediaFile(audio, "audio");
+    } finally { finishActivity(); }
 }
 
 function assertAudioConfig(config: AiConfig, model: string) {

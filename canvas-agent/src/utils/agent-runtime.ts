@@ -6,7 +6,7 @@ export function redactAgentLog(text: string): string {
         .replace(/(authorization\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n,;]+)/gi, "$1[REDACTED]")
         .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, "$1[REDACTED]")
         .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]")
-        .replace(/((?:api[ _-]*key|token)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1[REDACTED]");
+        .replace(/((?:api[ _-]*key|token|cookie|set-cookie)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n]+)/gi, "$1[REDACTED]");
 }
 
 /** Buffer stderr by line so credentials split across chunks are redacted as one value. */

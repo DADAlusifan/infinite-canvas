@@ -1,31 +1,20 @@
 # Infinite Canvas Agent
 
-本地 Canvas Agent 用来连接画布网页和用户电脑上的 Codex / Claude Code。本地开发时优先连接 `http://localhost:23147`，不需要先使用线上站点。
+本地 Canvas Agent 用来连接画布网页和用户电脑上的 Codex、DeepSeek（DSH）。Claude Code Adapter 暂时保留。本地开发时优先连接 `http://localhost:23147`，不需要先使用线上站点。
 
 ## 启动
 
-```bash
-npx -y @basketikun/canvas-agent@latest
-```
-
-带上 `@latest` 是因为 npx 会缓存已下载的版本，不加就可能一直运行旧版本。
-
-需要排查连接、线程、Codex app-server 或工具调用问题时，可开启 Debug 模式：
-
-```bash
-npx -y @basketikun/canvas-agent@latest --debug
-```
-
-Debug 日志会以 `[DEBUG][HH:mm:ss]` 等传统格式输出到终端，并按启动日期保存到 `~/.infinite-canvas/logs/canvas-agent-YYYY-MM-DD.log`。终端日志带级别颜色，文件日志为纯文本；日志包含 HTTP、SSE、线程、turn、Codex app-server 和工具调用事件，token 与图片 Data URL 会自动隐藏。
-
-本仓库开发时也可以直接运行：
+本分支的 DSH 接入请从本仓库源码启动；已发布的 npm 包不代表包含这里尚未发布的改动。准备 Bun 和 Node.js `^22.19.0 || >=24.0.0`：
 
 ```bash
 cd canvas-agent
-npm install
-npm run build
-node dist/index.js
+bun install
+bun run dev
 ```
+
+需要排查连接、线程或工具问题时，在同一目录运行 `bun run debug`。日志会输出到终端，并保存到 `~/.infinite-canvas/logs/canvas-agent-YYYY-MM-DD.log`；token 和图片 Data URL 会脱敏。DSH 另通过本次启动的临时覆盖关闭额外会话日志与遥测，不改写用户的 DSH 配置。
+
+只使用已发布的 Codex 功能时，也可运行 `npx -y @basketikun/canvas-agent@latest`；`@latest` 用于避免复用旧版 npx 缓存。
 
 启动后会输出本机地址和 token：
 
@@ -140,9 +129,17 @@ default_tools_approval_mode = "approve"
 
 侧边栏上传或粘贴的图片会先发到本机 Canvas Agent，再由 Canvas Agent 临时写入本机文件并作为 app-server `localImage` 输入传给 Codex；前端会提示附件体积，单次请求体限制为 30MB。
 
+## 侧边栏 DeepSeek（DSH）
+
+在 Agent 面板选择 DeepSeek（DSH）后，Canvas Agent 按需启动自己拥有的官方 Web Host 子进程（`ownedWebHost`），只监听本机。DSH 依赖固定为 `0.2.1-alpha.4`；默认复用 `~/.dsh`，也可通过 `DSH_HOME` 指向已有 DSH 数据目录。关闭 Canvas Agent 会收尾自己启动的进程，不接管或关闭用户另行启动的 DSH 实例。Tauri 安装包暂不内置 Canvas Agent、DSH 或 Node 运行时。
+
+模型、权限、会话历史和 Skill 使用 DSH 原生能力，与 Codex 分别维护；DSH 配置入口打开同一 Host 的官方设置页。模型请求和工具能力取决于本机 DSH 配置，画布写操作仍需遵循网页侧确认。DSH Skill 使用 `/name`，当前站点管理目录为工作空间下的 `.dsh/skills`；其它来源只读，停用与启用写入 DSH frontmatter。空白新建、从对话提炼、从画布提炼均先得到可编辑草稿，只有保存才写入 Skill；提炼使用无工具的独立临时会话，完成、失败或取消后归档。
+
+DSH 原生会话、凭据和工作空间文件留在应用外部，不包含在网页或桌面「完整备份」中。隔离临时数据目录中的真实官方 Host 与本地模拟模型已完成联调，未使用用户凭据或付费模型；真实账号/模型、安装、浏览器/Tauri 和 Windows 异常场景仍待验收，详见[引擎接入说明与可选原生冒烟](../docs/content/docs/development/agent-engines.zh-CN.mdx)和[待测试](../docs/content/docs/progress/pending-test.zh-CN.mdx)。
+
 ## Claude Code
 
-Claude Code Adapter 代码暂时保留，但当前网页侧边栏只开放 Codex。后续开放 Claude 入口时，Canvas Agent 会调用本机 `claude -p --output-format stream-json` 并把流式 JSON 事件转发到侧边栏。
+Claude Code Adapter 代码暂时保留，当前网页侧边栏开放 Codex 和 DeepSeek（DSH）。后续开放 Claude 入口时，Canvas Agent 会调用本机 `claude -p --output-format stream-json` 并把流式 JSON 事件转发到侧边栏。
 
 如果希望 Claude Code 也能操作画布，需要给 Claude Code 添加同一个 MCP。建议用 user scope，避免 Canvas Agent 从不同目录启动时找不到配置：
 

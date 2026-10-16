@@ -1,12 +1,14 @@
+import { preferences } from "@/services/storage/preferences";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { App, Button, Tooltip } from "antd";
+import { App, Button, Dropdown, Tooltip } from "antd";
 import dayjs from "dayjs";
-import { Bot, History, MessageSquare, PanelRightClose, PlugZap, Plus, Sparkles, Terminal } from "lucide-react";
+import { Bot, ChevronDown, History, MessageSquare, PanelRightClose, PlugZap, Plus, Settings, Sparkles, Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
 import { readAgentUrlBootstrap } from "@/lib/agent/agent-url-bootstrap";
+import { acceptsAgentEvent, agentIsBusy, cancelPendingAgentTool, enginePreferenceKey, getAgentScope, invalidateAgentScope, isCurrentAgentScope, StaleAgentResponseError, type AgentEngineId, type AgentToolIdentity, type DshConfigProfile } from "@/lib/agent/agent-engine";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
 import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
@@ -21,7 +23,7 @@ import { useShallow } from "zustand/react/shallow";
 import { useAgentStore, type AgentAttachment, type AgentBootstrapStatus, type AgentCanvasContext, type AgentCanvasReference, type AgentChatItem, type AgentConversationState, type AgentModel, type AgentPendingApproval, type AgentPendingToolCall, type AgentPermissionMode, type AgentReasoningEffort, type AgentThreadSummary } from "@/stores/use-agent-store";
 import { type CanvasAgentOp, type CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { isSiteTool, runSiteTool } from "@/lib/agent/agent-site-tools";
-import { acknowledgeCodexHistory, activateAgentClient, AgentApiError, discoverAgentConfig, fetchAgentJson, interruptCodexTurn, postCodexApproval, postState, postToolResult } from "@/services/api/canvas-agent";
+import { acknowledgeAgentHistory, activateAgentClient, activateAgentEngine, agentTurnSettings, AgentApiError, discoverAgentConfig, fetchAgentJson, fetchAgentEngines, interruptAgentTurn, openAgentSettings, postAgentApproval, postState, postToolResult, switchDshConfigProfile, type AgentEngineActivation, type AgentEngineCatalog } from "@/services/api/canvas-agent";
 import { AgentChatTimeline, AgentTaskProgress, AgentUsageBar } from "./agent-chat";
 import { AgentChatComposer } from "./agent-chat-composer";
 import { AgentConnectView } from "./agent-connect-view";
@@ -66,16 +68,20 @@ import { AgentHistoryView } from "./agent-history-view";
 import { AgentLogView } from "./agent-log-view";
 import { AgentPanelTabs } from "./agent-panel-tabs";
 import { AgentSkillsView } from "./agent-skills-view";
+import { mergeDshEventMessage, normalizeDshChatItem, type DshEvent } from "./agent-dsh-events";
 
 const MAX_ATTACHMENTS = 6;
 const MAX_ATTACHMENT_PAYLOAD_BYTES = 28 * 1024 * 1024;
 const MESSAGE_PREVIEW_LONG_EDGE = 192;
 const MESSAGE_PREVIEW_MAX_LENGTH = 500_000;
 const DEFAULT_AGENT_URL = "http://127.0.0.1:17371";
-const AGENT_PROTOCOL_VERSION = 6;
+const AGENT_PROTOCOL_VERSION = 7;
 const HISTORY_RETRY_DELAYS_MS = [0, 150, 350, 700, 1200];
-const AGENT_REASONING_EFFORTS = new Set<AgentReasoningEffort>(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
-const rt = (key: string, options?: Record<string, unknown>) => i18n.t(`agent.runtime.${key}`, options);
+const rt = (key: string, options?: Record<string, unknown>) => {
+    if (key === "codexRunning" || key === "waitingCodexApproval") return i18n.t(`agentEngines.${key === "codexRunning" ? "running" : "waitingApproval"}`, { engine: useAgentStore.getState().engineId === "dsh" ? "DSH" : "Codex" });
+    if (key === "agentNotFound") return i18n.t("agentEngines.agentNotFound");
+    return i18n.t(`agent.runtime.${key}`, options);
+};
 
 type AgentWorkspace = { workspacePath: string; activeThreadId?: string };
 type AgentThreadsResponse = { ok?: boolean; workspace?: AgentWorkspace; conversation?: AgentConversationState; data?: AgentThreadSummary[] };
@@ -83,8 +89,8 @@ type AgentThreadResponse = { ok?: boolean; workspace?: AgentWorkspace; conversat
 type AgentWorkspaceResponse = { ok?: boolean; workspace?: AgentWorkspace; conversation?: AgentConversationState };
 type AgentTurnResponse = { ok?: boolean; threadId?: string };
 type AgentModelsResponse = { ok?: boolean; data?: AgentModel[] };
-type AgentCodexState = { busy?: boolean; threadId?: string; turnId?: string };
-type AgentHelloEvent = { ok?: boolean; protocolVersion?: number; clientId?: string; workspace?: { activeThreadId?: string }; conversation?: AgentConversationState; codex?: AgentCodexState; pendingApprovals?: AgentPendingApproval[] };
+type AgentCodexState = { busy?: boolean; globalBusy?: boolean; threadId?: string; turnId?: string };
+type AgentHelloEvent = AgentEngineCatalog & { engineId: AgentEngineId; ok?: boolean; protocolVersion?: number; clientId?: string; workspace?: { activeThreadId?: string }; conversation?: AgentConversationState; codex?: AgentCodexState; agent?: AgentCodexState; pendingApprovals?: AgentPendingApproval[] };
 type AgentWorkspaceEvent = { activeThreadId?: string; threadId?: string; sourceClientId?: string; emptyThread?: boolean; draftThread?: boolean; conversation?: AgentConversationState };
 type AgentChatEvent = { threadId?: string; turnId?: string; sourceClientId?: string; replayed?: boolean; message?: AgentChatItem };
 type AgentBootstrapEvent = { type?: "codex.preparing" | "codex.prepare_failed" | "mcp.startup" | "mcp.complete"; phase?: "preheat" | "runtime"; threadId?: string; name?: string; status?: "starting" | "ready" | "failed" | "cancelled"; error?: string | null; failureReason?: string | null };
@@ -134,8 +140,13 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     // canvasContext is intentionally excluded because project updates it every frame during dragging and resizing.
     // The panel uses it only for ref synchronization and debounced postState calls, never during rendering.
     // Subscribing here would rerender the panel every frame and amplify the #185 crash, so it is observed imperatively below.
-    const { width, url, token, connected, enabled, prompt, attachments, sending, waiting, tokenUsage, eventLogs, threads, activeThreadId, workspacePath, loadingThreads, activeTab, confirmTools, permissionMode, models, model, reasoningEffort, activity, conversation, connectError, pendingTool, pendingApprovals } = useAgentStore(
+    const { engineId, runtimeId, engines, switchingEngine, engineBusy, width, url, token, connected, enabled, prompt, attachments, sending, waiting, tokenUsage, eventLogs, threads, activeThreadId, workspacePath, loadingThreads, activeTab, confirmTools, permissionMode, models, model, reasoningEffort, activity, conversation, connectError, pendingTool, pendingApprovals } = useAgentStore(
         useShallow((state) => ({
+            engineId: state.engineId,
+            runtimeId: state.runtimeId,
+            engines: state.engines,
+            switchingEngine: state.switchingEngine,
+            engineBusy: agentIsBusy(state),
             width: state.width,
             url: state.url,
             token: state.token,
@@ -185,12 +196,28 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const clientIdRef = useRef("");
     const [clientReady, setClientReady] = useState(false);
     const loadThreadsSequenceRef = useRef(0);
+    const loadThreadsRequestRef = useRef(0);
     const threadMessagesRef = useRef(new Map<string, AgentChatItem[]>());
     const authoritativeHistoryTurnsRef = useRef(new Set<string>());
     const liveTurnKeysRef = useRef(new Set<string>());
+    const nativeSettingsThreadRef = useRef("");
+    const settingsOpenedRef = useRef(false);
+    const engineSwitchOperationRef = useRef<symbol | null>(null);
+    const [catalogRevision, setCatalogRevision] = useState(0);
     const threadOperationRef = useRef(0);
     const threadOperationSequenceRef = useRef(0);
     const endpoint = useMemo(() => url.trim().replace(/\/$/, ""), [url]);
+    const currentEngine = engines.find((item) => item.id === engineId);
+    useLayoutEffect(() => {
+        loadThreadsSequenceRef.current += 1;
+        threadMessagesRef.current.clear();
+        authoritativeHistoryTurnsRef.current.clear();
+        liveTurnKeysRef.current.clear();
+        nativeSettingsThreadRef.current = "";
+        settingsOpenedRef.current = false;
+        threadOperationRef.current = 0;
+        pendingToolRef.current = null;
+    }, [engineId, runtimeId]);
     const urlAgentAutoConnect = searchParams.has("agentUrl") && searchParams.has("agentToken");
     useEffect(() => {
         let disposed = false;
@@ -203,38 +230,49 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         return () => { disposed = true; };
     }, []);
     const loadThreadSnapshot = useCallback(async (threadId: string, sequence: number, response?: AgentThreadResponse, expectedTurnId = "") => {
+        const scope = getAgentScope();
         let thread = response;
         let lastError: unknown;
         for (const delayMs of HISTORY_RETRY_DELAYS_MS) {
             if (delayMs) await delay(delayMs);
-            if (sequence !== loadThreadsSequenceRef.current || useAgentStore.getState().activeThreadId !== threadId) return false;
+            if (!isCurrentAgentScope(scope) || sequence !== loadThreadsSequenceRef.current || useAgentStore.getState().activeThreadId !== threadId) return false;
             try {
-                thread ||= await fetchAgentJson<AgentThreadResponse>(endpoint, token, `/agent/codex/threads/${encodeURIComponent(threadId)}`);
+                thread ||= await fetchAgentJson<AgentThreadResponse>(endpoint, token, `/agent/${engineId}/threads/${encodeURIComponent(threadId)}`);
                 lastError = undefined;
             } catch (error) {
+                if (error instanceof StaleAgentResponseError) return;
                 lastError = error;
                 thread = undefined;
                 continue;
             }
-            const history = normalizeHistoryMessages(thread.messages || []);
+            const rawHistory = thread.messages || [];
+            const history = normalizeHistoryMessages(scope.engineId === "dsh" ? rawHistory.map((item) => normalizeDshChatItem(item)) : rawHistory);
             const latest = useAgentStore.getState();
-            if (sequence !== loadThreadsSequenceRef.current || latest.activeThreadId !== threadId) return false;
+            if (!isCurrentAgentScope(scope) || sequence !== loadThreadsSequenceRef.current || latest.activeThreadId !== threadId) return false;
             const historyTurns = authoritativeHistoryTurnKeys(threadId, thread.settledTurnIds || []);
             const hasExpectedTurn = !expectedTurnId || historyTurns.has(`${threadId}\0${expectedTurnId}`);
             historyTurns.forEach((key) => liveTurnKeysRef.current.delete(key));
-            if (latest.activeTurnId) liveTurnKeysRef.current.add(`${threadId}\0${latest.activeTurnId}`);
+            if (latest.activeTurnId && !historyTurns.has(`${threadId}\0${latest.activeTurnId}`)) liveTurnKeysRef.current.add(`${threadId}\0${latest.activeTurnId}`);
             authoritativeHistoryTurnsRef.current = historyTurns;
             const messages = mergeAgentMessages(history, latest.messages, threadId, liveTurnKeysRef.current);
             threadMessagesRef.current.set(threadId, messages);
             setAgentState({ messages, connectError: "" });
+            if (scope.engineId === "dsh" && thread.thread && nativeSettingsThreadRef.current !== threadId) {
+                const selection = thread.thread.modelSelection;
+                setAgentState({
+                    ...(selection && !latest.modelChanged ? { model: JSON.stringify([selection.provider, selection.model]), reasoningEffort: selection.effort || "" } : {}),
+                    ...(thread.thread.permissionMode && !latest.permissionChanged ? { permissionMode: thread.thread.permissionMode } : {}),
+                });
+                nativeSettingsThreadRef.current = threadId;
+            }
             const coveredTurnIds = [...historyTurns].map((key) => key.slice(threadId.length + 1));
-            if (coveredTurnIds.length) void acknowledgeCodexHistory(endpoint, token, threadId, coveredTurnIds).catch(() => undefined);
+            if (coveredTurnIds.length) void acknowledgeAgentHistory(endpoint, token, threadId, coveredTurnIds).catch(() => undefined);
             if (hasExpectedTurn && (thread.historyReady !== false || Boolean(expectedTurnId))) return true;
             thread = undefined;
         }
         if (lastError) throw lastError;
         return false;
-    }, [endpoint, setAgentState, token]);
+    }, [engineId, endpoint, setAgentState, token]);
     const applyWorkspaceChange = useCallback((data: AgentWorkspaceEvent) => {
         const nextThreadId = data.activeThreadId ?? data.threadId ?? "";
         const current = useAgentStore.getState();
@@ -253,6 +291,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         }
         if (emptyThread && nextThreadId) threadMessagesRef.current.delete(nextThreadId);
         if (threadChanged || emptyThread) {
+            nativeSettingsThreadRef.current = "";
             loadThreadsSequenceRef.current += 1;
             authoritativeHistoryTurnsRef.current.clear();
             liveTurnKeysRef.current.clear();
@@ -288,12 +327,32 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         setAgentState({ conversation: next, ...conversationBootstrapView(next) });
         return true;
     }, [applyWorkspaceChange, setAgentState]);
+    const applyEngineResult = useCallback((data: AgentEngineActivation | AgentHelloEvent) => {
+        const id = data.activeEngineId;
+        const previous = useAgentStore.getState();
+        const changed = previous.engineId !== id || previous.runtimeId !== data.runtimeId;
+        const engine = data.engines?.find((item) => item.id === id) || ("engine" in data ? data.engine : undefined);
+        const previousProfile = previous.engines.find((item) => item.id === "dsh")?.configProfile;
+        const profileChanged = previous.engineId === "dsh" && id === "dsh" && previousProfile && engine?.configProfile && previousProfile !== engine.configProfile;
+        useAgentStore.getState().applyEngine(id, data.runtimeId, data.engines);
+        if (profileChanged) setAgentState({ models: [], model: "", reasoningEffort: "", permissionMode: "", modelChanged: false, permissionChanged: false });
+        const current = useAgentStore.getState();
+        const permissions = engine?.capabilities.permissions || [];
+        setAgentState({
+            globalBusy: Boolean(data.globalBusy),
+            permissionMode: permissions.some((item) => item.id === current.permissionMode) ? current.permissionMode : engine?.capabilities.defaultPermissionMode || "",
+            ...(data.workspace && "workspacePath" in data.workspace ? { workspacePath: data.workspace.workspacePath as string } : {}),
+        });
+        if (data.conversation) applyConversationState(data.conversation, changed);
+    }, [applyConversationState, setAgentState]);
     const loadThreads = useCallback(async (skipHistory = false, expectedTurnId = "") => {
         if (!connectedRef.current && !useAgentStore.getState().connected) return;
+        const scope = getAgentScope();
+        const request = ++loadThreadsRequestRef.current;
         let sequence = ++loadThreadsSequenceRef.current;
         setAgentState({ loadingThreads: true });
         try {
-            const data = await fetchAgentJson<AgentThreadsResponse>(endpoint, token, `/agent/codex/threads`);
+            const data = await fetchAgentJson<AgentThreadsResponse>(endpoint, token, `/agent/${engineId}/threads`);
             if (sequence !== loadThreadsSequenceRef.current) return;
             if (data.conversation) {
                 applyConversationState(data.conversation);
@@ -311,11 +370,13 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 liveTurnKeysRef.current.clear();
             }
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             addEventLog(rt("historyReadFailed"), error);
         } finally {
-            if (sequence === loadThreadsSequenceRef.current && !threadOperationRef.current) setAgentState({ loadingThreads: false });
+            // A workspace event may invalidate history without starting another request.
+            if (request === loadThreadsRequestRef.current && isCurrentAgentScope(scope) && !threadOperationRef.current) setAgentState({ loadingThreads: false });
         }
-    }, [applyConversationState, applyWorkspaceChange, endpoint, loadThreadSnapshot, setAgentState, token]);
+    }, [applyConversationState, applyWorkspaceChange, engineId, endpoint, loadThreadSnapshot, setAgentState, token]);
     // Imperatively subscribe to canvasContext to keep the ref current and debounce snapshot reports without rerendering the panel.
     useEffect(() => {
         let timer: ReturnType<typeof setTimeout> | null = null;
@@ -338,19 +399,35 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         pendingToolRef.current = pendingTool;
     }, [pendingTool]);
     useEffect(() => () => attachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url)), []);
+    useEffect(() => {
+        const cancelSwitch = () => {
+            if (!engineSwitchOperationRef.current) return;
+            engineSwitchOperationRef.current = null;
+            setAgentState({ switchingEngine: false });
+        };
+        const unsubscribe = useAgentStore.subscribe((state, previous) => {
+            if (previous.connected && !state.connected || previous.enabled && !state.enabled) cancelSwitch();
+        });
+        return () => { unsubscribe(); cancelSwitch(); };
+    }, [setAgentState]);
 
     useEffect(() => {
         if (!clientReady || !enabled || !token.trim()) return;
-        localStorage.setItem("canvas-agent-url", endpoint);
-        localStorage.setItem("canvas-agent-token", token);
+        preferences.setItem("canvas-agent-url", endpoint);
+        preferences.setItem("canvas-agent-token", token);
         const clientId = clientIdRef.current;
         let disposed = false;
         let protocolRejected = false;
         let eventQueue = Promise.resolve();
         const isCurrentConnection = () => !disposed && clientIdRef.current === clientId;
+        const readScopedEvent = <T,>(event: Event): T | null => {
+            const data = parseEventData<T & { engineId?: string; runtimeId?: string }>(event);
+            return data && acceptsAgentEvent(data) ? data : null;
+        };
         const enqueueEvent = (task: () => void | Promise<void>) => {
+            const scope = getAgentScope();
             eventQueue = eventQueue.then(async () => {
-                if (isCurrentConnection()) await task();
+                if (isCurrentConnection() && isCurrentAgentScope(scope)) await task();
             }).catch((error) => {
                 if (isCurrentConnection()) addEventLog(rt("conversationSyncFailed"), error);
             });
@@ -370,7 +447,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 if (!headless) message.error(text);
                 return;
             }
-            const codex = hello?.codex;
+            applyEngineResult(hello);
+            const codex = hello.agent || hello.codex;
             const busy = Boolean(codex?.busy);
             const nextThreadId = hello?.conversation?.threadId ?? hello?.workspace?.activeThreadId ?? useAgentStore.getState().activeThreadId;
             if (hello?.conversation) applyConversationState(hello.conversation, true);
@@ -379,7 +457,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             const nextTurnId = codex?.threadId === nextThreadId ? codex.turnId ?? "" : "";
             if (nextTurnId) liveTurnKeysRef.current.add(`${nextThreadId}\0${nextTurnId}`);
             const activeTurnId = busy ? nextTurnId : "";
-            const pendingApprovals = busy ? (hello?.pendingApprovals || []).filter((item) => !item.threadId || item.threadId === nextThreadId) : [];
+            const pendingApprovals = (hello?.pendingApprovals || []).filter((item) => !item.threadId || item.threadId === nextThreadId).map((item) => ({ ...item, engineId: hello.activeEngineId, runtimeId: hello.runtimeId }));
             const messages = activeTurnId
                 ? bindPendingTurnMessages(current.messages.filter((item) => !isConnectionErrorMessage(item)), nextThreadId, activeTurnId)
                 : current.messages.filter((item) => !isConnectionErrorMessage(item));
@@ -401,22 +479,30 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             if (!headless) message.success(rt("localAgentConnected"));
             void postState(endpoint, token, clientId, canvasContextRef.current?.snapshot || null);
             if (document.visibilityState === "visible" && document.hasFocus()) void activateAgentClient(endpoint, token, clientId);
-            if (!busy && !nextThreadId && (!hello?.conversation || hello.conversation.status === "idle")) {
-                void fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, "/agent/codex/threads/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId, permissionMode }) })
+            if (hello.activeEngineId === engineId && !busy && !nextThreadId && (!hello?.conversation || hello.conversation.status === "idle")) {
+                void fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, `/agent/${engineId}/threads/reset`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId, ...(permissionMode ? { permissionMode } : {}) }) })
                     .then((result) => result.conversation && applyConversationState(result.conversation))
                     .catch((error) => {
+                        if (error instanceof StaleAgentResponseError) return;
                         const state = agentErrorState(error);
                         if (state) applyConversationState(state);
                         addEventLog(rt("conversationInitFailed"), error);
                     });
             }
         });
-        source.addEventListener("codex_state", (event) => {
-            const data = parseEventData<AgentCodexState>(event);
+        source.addEventListener("engine_changed", (event) => {
+            if (!isCurrentConnection()) return;
+            const data = parseEventData<AgentEngineActivation>(event);
+            if (!data || !data.runtimeId || !data.activeEngineId) return;
+            applyEngineResult(data);
+        });
+        const onAgentState = (event: Event) => {
+            const data = readScopedEvent<AgentCodexState>(event);
             if (!data) return;
             enqueueEvent(async () => {
                 const busy = Boolean(data.busy);
                 const current = useAgentStore.getState();
+                setAgentState({ globalBusy: Boolean(data.globalBusy ?? data.busy) });
                 const appliesToCurrentThread = !data.threadId || data.threadId === current.activeThreadId;
                 if (!appliesToCurrentThread) return;
                 const turnId = data.turnId || current.activeTurnId;
@@ -424,6 +510,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 const activeTurnId = busy ? turnId : "";
                 const messages = activeTurnId ? bindPendingTurnMessages(current.messages, current.activeThreadId, activeTurnId) : current.messages;
                 setAgentState({
+                    globalBusy: Boolean(data.globalBusy ?? data.busy),
+                    stopping: busy ? current.stopping : false,
                     activity: busy ? rt("codexRunning") : current.activity === rt("processingFailed") ? rt("processingFailed") : rt("completed"),
                     waiting: busy,
                     sending: false,
@@ -432,32 +520,49 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 });
                 if (!busy && current.waiting) void loadThreads(false, turnId);
             });
-        });
+        };
+        source.addEventListener("codex_state", onAgentState);
+        source.addEventListener("agent_state", onAgentState);
         source.addEventListener("tool_call", (event) => {
             if (!isCurrentConnection()) return;
-            const data = parseEventData<AgentPendingToolCall>(event);
+            const data = readScopedEvent<AgentPendingToolCall>(event);
             if (data) void handleToolCall(endpoint, token, data);
         });
-        source.addEventListener("codex_approval", (event) => {
+        source.addEventListener("tool_cancelled", (event) => {
             if (!isCurrentConnection()) return;
-            const data = parseEventData<AgentPendingApproval>(event);
+            const data = readScopedEvent<AgentToolIdentity>(event);
+            if (!data) return;
+            pendingToolRef.current = cancelPendingAgentTool(pendingToolRef.current, data);
+            const current = useAgentStore.getState().pendingTool;
+            const pendingTool = cancelPendingAgentTool(current, data);
+            if (pendingTool !== current) setAgentState({ pendingTool });
+        });
+        const onApproval = (event: Event) => {
+            if (!isCurrentConnection()) return;
+            const data = readScopedEvent<AgentPendingApproval>(event);
             if (!data || !isCurrentThreadEvent(data)) return;
             setAgentState({ pendingApprovals: [...useAgentStore.getState().pendingApprovals.filter((item) => item.requestId !== data.requestId), data], activity: rt("awaitingApproval") });
             addEventLog(rt("awaitingApproval"), data.reason || data.method, data);
-        });
-        source.addEventListener("codex_approval_resolved", (event) => {
+        };
+        source.addEventListener("codex_approval", onApproval);
+        source.addEventListener("agent_approval", onApproval);
+        source.addEventListener("dsh_approval", onApproval);
+        const onApprovalResolved = (event: Event) => {
             if (!isCurrentConnection()) return;
-            const data = parseEventData<{ requestId?: string; decision?: "accept" | "acceptForSession" | "decline" | "cancel" }>(event);
+            const data = readScopedEvent<{ requestId?: string; decision?: string }>(event);
             if (!data?.requestId) return;
             const current = useAgentStore.getState();
             const approval = current.pendingApprovals.find((item) => item.requestId === data.requestId);
             const pendingApprovals = current.pendingApprovals.filter((item) => item.requestId !== data.requestId);
             setAgentState({ pendingApprovals, activity: approvalActivity(pendingApprovals, current.waiting, current.activity) });
             const decision = data.decision || approval?.deciding;
-            if (approval && decision) addEventLog(rt(decision === "accept" || decision === "acceptForSession" ? "approvalGranted" : "approvalCanceled"), approval.reason || approval.method, approval);
-        });
+            if (approval && decision) addEventLog(rt(["accept", "acceptForSession", "allowed-once"].includes(decision) ? "approvalGranted" : "approvalCanceled"), approval.reason || approval.method, approval);
+        };
+        source.addEventListener("codex_approval_resolved", onApprovalResolved);
+        source.addEventListener("agent_approval_resolved", onApprovalResolved);
+        source.addEventListener("dsh_approval_resolved", onApprovalResolved);
         source.addEventListener("agent_event", (event) => {
-            const data = parseEventData<AgentEventPayload>(event);
+            const data = readScopedEvent<AgentEventPayload>(event);
             if (data) enqueueEvent(() => {
                 if (!isCurrentThreadEvent(data)) return;
                 const shouldProcess = registerLiveAgentTurn(data, authoritativeHistoryTurnsRef.current, liveTurnKeysRef.current);
@@ -465,8 +570,32 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 return handleAgentEvent(data);
             });
         });
+        source.addEventListener("dsh_event", (event) => {
+            const data = readScopedEvent<DshEvent>(event);
+            if (!data || data.engineId !== "dsh") return;
+            enqueueEvent(() => {
+                if (!isCurrentThreadEvent(data)) return;
+                if (data.type === "history.snapshot") {
+                    const removed = new Set(data.removeItemIds || []);
+                    if (removed.size) setAgentState({ messages: useAgentStore.getState().messages.filter((item) => item.threadId !== data.threadId || !removed.has(item.itemId || "")) });
+                    return loadThreadSnapshot(data.threadId, ++loadThreadsSequenceRef.current, { messages: data.messages || [], settledTurnIds: data.settledTurnIds || [], historyReady: true }).then(() => undefined);
+                }
+                if (data.type === "usage.updated" && data.usage) { setAgentState({ tokenUsage: data.usage }); return; }
+                if (!registerLiveAgentTurn(data, authoritativeHistoryTurnsRef.current, liveTurnKeysRef.current)) return;
+                const current = useAgentStore.getState();
+                if (data.item || data.removeItemId) {
+                    setAgentState({ messages: mergeDshEventMessage(current.messages, data) });
+                }
+                if (data.type === "turn.started") setAgentState({ waiting: true, sending: false, activeTurnId: data.turnId, messages: bindPendingTurnMessages(current.messages, data.threadId, data.turnId), activity: t("agentEngines.running", { engine: "DSH" }) });
+                if (data.type === "turn.completed" || data.type === "turn.failed") {
+                    setAgentState({ waiting: false, sending: false, stopping: false, activeTurnId: "", activity: data.status === "interrupted" ? rt("taskStopped") : rt(data.type === "turn.failed" ? "processingFailed" : "completed") });
+                    void loadThreads(false, data.turnId);
+                }
+                if (data.type === "turn.failed" && data.error) addMessage({ role: "error", threadId: data.threadId, turnId: data.turnId, text: typeof data.error === "string" ? data.error : data.error.message || rt("processingFailed") });
+            });
+        });
         source.addEventListener("agent_bootstrap", (event) => {
-            const data = parseEventData<AgentBootstrapEvent>(event);
+            const data = readScopedEvent<AgentBootstrapEvent>(event);
             if (!data?.type) return;
             if (data.type === "codex.preparing") {
                 addEventLog(rt("conversationInitializing"), rt("conversationCreating"), data);
@@ -492,11 +621,11 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             addEventLog(status.text, status.detail, data);
         });
         source.addEventListener("conversation_changed", (event) => {
-            const data = parseEventData<AgentConversationState>(event);
+            const data = readScopedEvent<AgentConversationState>(event);
             if (data) enqueueEvent(() => { applyConversationState(data); });
         });
         source.addEventListener("workspace_changed", (event) => {
-            const data = parseEventData<AgentWorkspaceEvent>(event);
+            const data = readScopedEvent<AgentWorkspaceEvent>(event);
             if (!data) return;
             enqueueEvent(() => {
                 if (data.conversation) applyConversationState(data.conversation);
@@ -505,7 +634,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             });
         });
         source.addEventListener("chat_message", (event) => {
-            const data = parseEventData<AgentChatEvent>(event);
+            const data = readScopedEvent<AgentChatEvent>(event);
             if (!data?.message) return;
             enqueueEvent(() => {
                 if (!isCurrentThreadEvent(data)) return;
@@ -525,16 +654,19 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         });
         source.addEventListener("agent_log", (event) => {
             if (!isCurrentConnection()) return;
-            const text = parseEventData<{ text?: unknown }>(event)?.text;
+            const data = readScopedEvent<{ text?: unknown }>(event);
+            if (!data) return;
+            const text = data.text;
             addEventLog(rt("log"), text, text);
         });
         source.addEventListener("skills_changed", (event) => {
             if (!isCurrentConnection()) return;
-            const data = parseEventData<{ forceReload?: boolean }>(event);
+            const data = readScopedEvent<{ forceReload?: boolean }>(event);
+            if (!data) return;
             void loadSkills(endpoint, token, Boolean(data?.forceReload));
         });
         source.addEventListener("agent_error", (event) => {
-            const data = parseEventData<AgentEventPayload>(event);
+            const data = readScopedEvent<AgentEventPayload>(event);
             if (!data) return;
             enqueueEvent(() => {
                 if (!isCurrentThreadEvent(data)) return;
@@ -544,6 +676,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         });
         source.onerror = () => {
             if (disposed || protocolRejected) return;
+            invalidateAgentScope();
             const wasConnected = connectedRef.current;
             const silent = useAgentStore.getState().silentConnect && !wasConnected;
             const text = rt(wasConnected ? "connectionLostDescription" : "connectionFailedDescription");
@@ -573,48 +706,63 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         };
         return () => {
             disposed = true;
+            invalidateAgentScope();
             source.close();
             connectedRef.current = false;
+            nativeSettingsThreadRef.current = "";
             loadThreadsSequenceRef.current += 1;
             useAgentSkillStore.getState().reset();
         };
-    }, [applyConversationState, applyWorkspaceChange, clientReady, enabled, endpoint, loadSkills, loadThreads, message, setAgentState, token]);
+    }, [applyConversationState, applyEngineResult, applyWorkspaceChange, clientReady, enabled, engineId, runtimeId, endpoint, loadSkills, loadThreads, message, setAgentState, token]);
 
     useEffect(() => {
         if (connected) void loadThreads();
-    }, [connected, loadThreads]);
+    }, [connected, loadThreads, runtimeId]);
 
     useEffect(() => {
         if (connected) void loadSkills(endpoint, token);
-    }, [connected, endpoint, loadSkills, token]);
+    }, [connected, engineId, runtimeId, catalogRevision, endpoint, loadSkills, token]);
 
     useEffect(() => {
         if (!connected) return;
-        void fetchAgentJson<AgentModelsResponse>(endpoint, token, "/agent/codex/models").then(({ data = [] }) => {
-            const names = new Set<string>();
+        const scope = getAgentScope();
+        void fetchAgentEngines(endpoint, token).then((catalog) => {
+            if (isCurrentAgentScope(scope) && catalog.activeEngineId === scope.engineId && catalog.runtimeId === scope.runtimeId) setAgentState({ engines: catalog.engines });
+        }).catch((error) => { if (isCurrentAgentScope(scope)) addEventLog(t("agentEngines.catalogFailed"), error); });
+    }, [connected, engineId, runtimeId, catalogRevision, endpoint, setAgentState, token]);
+
+    useEffect(() => {
+        if (!connected) return;
+        void fetchAgentJson<AgentModelsResponse>(endpoint, token, `/agent/${engineId}/models`).then(({ data = [] }) => {
             const models = data.flatMap((item) => {
-                const name = item.displayName || item.model;
-                const efforts = item.supportedReasoningEfforts.filter(({ reasoningEffort }) => AGENT_REASONING_EFFORTS.has(reasoningEffort));
-                if (item.model === "codex-auto-review" || names.has(name) || !efforts.length) return [];
-                names.add(name);
-                const defaultReasoningEffort = efforts.some((effort) => effort.reasoningEffort === item.defaultReasoningEffort) ? item.defaultReasoningEffort : efforts[0].reasoningEffort;
+                const efforts = item.supportedReasoningEfforts || [];
+                if (engineId === "codex" && item.model === "codex-auto-review") return [];
+                const defaultReasoningEffort = efforts.some((effort) => effort.reasoningEffort === item.defaultReasoningEffort) ? item.defaultReasoningEffort : efforts[0]?.reasoningEffort || "";
                 return [{ ...item, supportedReasoningEfforts: efforts, defaultReasoningEffort }];
             });
             if (!models.length) return;
             const savedModel = useAgentStore.getState().model;
-            const current = models.find((item) => item.model === savedModel) || models.find((item) => item.isDefault) || models[0];
+            const current = models.find((item) => (item.id || item.model) === savedModel) || models.find((item) => item.isDefault) || models[0];
             const savedEffort = useAgentStore.getState().reasoningEffort;
             const efforts = current.supportedReasoningEfforts.map((item) => item.reasoningEffort);
-            const nextEffort = efforts.includes(savedEffort as AgentReasoningEffort) ? savedEffort as AgentReasoningEffort : current.defaultReasoningEffort || efforts[0];
-            localStorage.setItem("canvas-agent-model", current.model);
-            localStorage.setItem("canvas-agent-reasoning-effort", nextEffort);
-            setAgentState({ models, model: current.model, reasoningEffort: nextEffort });
-        }).catch((error) => addEventLog(rt("modelListFailed"), error));
-    }, [connected, endpoint, setAgentState, token]);
+            const nextEffort = efforts.includes(savedEffort) ? savedEffort : current.defaultReasoningEffort || efforts[0] || "";
+            const model = current.id || current.model;
+            preferences.setItem(enginePreferenceKey(engineId, "model"), model);
+            preferences.setItem(enginePreferenceKey(engineId, "effort"), nextEffort);
+            setAgentState({ models, model, reasoningEffort: nextEffort });
+        }).catch((error) => { if (!(error instanceof StaleAgentResponseError)) addEventLog(rt("modelListFailed"), error); });
+    }, [connected, engineId, runtimeId, catalogRevision, endpoint, setAgentState, token]);
 
     useEffect(() => {
         if (!connected) return;
-        const activate = () => void activateAgentClient(endpoint, token, clientIdRef.current);
+        const activate = () => {
+            void activateAgentClient(endpoint, token, clientIdRef.current);
+            if (engineId === "dsh" && !agentIsBusy(useAgentStore.getState())) {
+                nativeSettingsThreadRef.current = "";
+                void loadThreads();
+                if (settingsOpenedRef.current) { settingsOpenedRef.current = false; setCatalogRevision((revision) => revision + 1); }
+            }
+        };
         const activateVisible = () => {
             if (document.visibilityState === "visible") activate();
         };
@@ -624,14 +772,16 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             window.removeEventListener("focus", activate);
             document.removeEventListener("visibilitychange", activateVisible);
         };
-    }, [connected, endpoint, token]);
+    }, [connected, engineId, endpoint, loadThreads, token]);
     const sendPrompt = async () => {
+        const scope = getAgentScope();
         const text = prompt.trim();
         const files = attachments;
         const skillState = useAgentSkillStore.getState();
         const selectedSkill = skillState.selectedSkill;
         const selectedSkillRevision = skillState.selectionRevision;
         const currentState = useAgentStore.getState();
+        if (currentState.switchingEngine || currentState.globalBusy || currentState.draftingSkill || currentState.stopping) return;
         const canvasNodeIds = new Set(currentState.canvasContext?.snapshot.nodes.map((node) => node.id) || []);
         const canvasReferences = currentState.canvasReferences.filter((item) => canvasNodeIds.has(item.nodeId));
         if (canvasReferences.length !== currentState.canvasReferences.length) {
@@ -645,7 +795,9 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             setAgentState({ sending: true, activity: rt("readingCanvasImages") });
             try {
                 referenceImages = await resolveCanvasReferenceImages(canvasReferences, currentState.canvasContext?.snapshot.nodes || []);
+                if (!isCurrentAgentScope(scope)) return;
             } catch (error) {
+                if (!isCurrentAgentScope(scope) || error instanceof StaleAgentResponseError) return;
                 setAgentState({ sending: false, activity: rt("canvasImageReadFailed") });
                 addMessage({ role: "error", title: rt("canvasImageReadFailed"), text: error instanceof Error ? error.message : rt("canvasImageReadFailed") });
                 return;
@@ -668,7 +820,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             const image = referenceImages.find((item) => item.id === `canvas:${nodeId}`);
             return { nodeId, label, title, kind, previewUrl: image ? (await createMessageAttachmentMetadata(image)).url : previewUrl, text };
         }));
-        const messageSkill = selectedSkill ? { name: selectedSkill.name, path: selectedSkill.path, displayName: selectedSkill.interface?.displayName || undefined } : undefined;
+        const messageSkill = selectedSkill ? { engineId, name: selectedSkill.name, path: selectedSkill.path, displayName: selectedSkill.interface?.displayName || undefined } : undefined;
+        if (!isCurrentAgentScope(scope)) return;
         loadThreadsSequenceRef.current += 1;
         const currentBeforeSend = useAgentStore.getState();
         const requestThreadId = currentBeforeSend.activeThreadId;
@@ -677,15 +830,17 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         let threadId = requestThreadId;
         try {
             const messageAttachments = await Promise.all(files.map(createMessageAttachmentMetadata));
+            if (!isCurrentAgentScope(scope)) return;
             const messageMetadata = {
                 ...(messageAttachments.length ? { attachments: messageAttachments } : {}),
                 ...(messageReferences.length ? { canvasReferences: messageReferences } : {}),
                 ...(messageSkill ? { skill: messageSkill } : {}),
             };
-            const modelName = models.find((item) => item.model === model)?.displayName || model || rt("defaultModel");
-            const effortName = reasoningEffort ? i18n.t(`agent.composer.effort.${reasoningEffort}`) : rt("defaultEffort");
+            const selectedModel = models.find((item) => (item.id || item.model) === model);
+            const modelName = selectedModel?.displayName || model || rt("defaultModel");
+            const effortName = reasoningEffort ? i18n.t(`agent.composer.effort.${reasoningEffort}`, { defaultValue: reasoningEffort }) : rt("defaultEffort");
             addEventLog(rt("sendTask"), `${modelName} · ${effortName}${selectedSkill ? ` · Skill ${selectedSkill.name}` : ""}${files.length ? ` · ${rt("attachmentCount", { count: files.length })}` : ""}${canvasReferences.length ? ` · ${rt("canvasReferenceCount", { count: canvasReferences.length })}` : ""} · ${compactText(text) || rt(canvasReferences.length ? "canvasReferencesOnly" : "attachmentsOnly")}`);
-            const accepted = await fetchAgentJson<AgentTurnResponse>(endpoint, token, "/agent/codex/turn", {
+            const accepted = await fetchAgentJson<AgentTurnResponse>(endpoint, token, `/agent/${engineId}/turn`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({
@@ -696,9 +851,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                     threadId,
                     conversationId: currentBeforeSend.conversation.conversationId,
                     expectedRevision: currentBeforeSend.conversation.revision,
-                    permissionMode,
-                    model,
-                    effort: reasoningEffort,
+                    ...agentTurnSettings(currentBeforeSend),
                     skill: selectedSkill ? { name: selectedSkill.name, path: selectedSkill.path } : undefined,
                     attachments: requestFiles.map(({ id, name, type, size, width, height, dataUrl }) => ({ id, name, type, size, width, height, dataUrl })),
                     messageMetadata,
@@ -706,12 +859,14 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             });
             threadId = accepted.threadId || threadId;
             if (!threadId) throw new Error(rt("startConversationFailed"));
+            setAgentState({ modelChanged: false, permissionChanged: false });
             if (selectedSkill) clearSkillSelection(selectedSkillRevision);
             files.forEach((item) => {
                 URL.revokeObjectURL(item.url);
                 attachmentUrlsRef.current.delete(item.url);
             });
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             const text = error instanceof Error ? error.message : rt("sendFailed");
             const response = error instanceof AgentApiError ? error.response as { code?: string; state?: AgentConversationState } : undefined;
             if (response?.state) applyConversationState(response.state);
@@ -742,18 +897,23 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
 
     const stopTurn = async () => {
         if (!connected || (!sending && !waiting)) return;
-        setAgentState({ activity: rt("stopping") });
+        const scope = getAgentScope();
+        setAgentState({ stopping: true, activity: rt("stopping") });
         try {
-            await interruptCodexTurn(endpoint, token, useAgentStore.getState().activeThreadId || undefined);
+            await interruptAgentTurn(endpoint, token, useAgentStore.getState().activeThreadId || undefined);
             addEventLog(rt("stopTask"), rt("taskStopped"));
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             setAgentState({ activity: rt("stopFailed") });
             addEventLog(rt("stopFailed"), error);
+        } finally {
+            if (isCurrentAgentScope(scope)) setAgentState({ stopping: false });
         }
     };
 
     const addAttachments = async (files: FileList | File[] | null) => {
         if (!files) return;
+        const scope = getAgentScope();
         const images = Array.from(files).filter((file) => file.type.startsWith("image/"));
         const prev = useAgentStore.getState().attachments;
         try {
@@ -766,6 +926,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                     return { id: createId(), name: file.name, type: file.type, size: file.size, width: meta.width, height: meta.height, url, dataUrl };
                 }),
             );
+            if (!isCurrentAgentScope(scope)) {
+                next.forEach((item) => { URL.revokeObjectURL(item.url); attachmentUrlsRef.current.delete(item.url); });
+                return;
+            }
             const merged = [...prev, ...next];
             if (attachmentPayloadBytes(merged) > MAX_ATTACHMENT_PAYLOAD_BYTES) {
                 next.forEach((item) => {
@@ -777,6 +941,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             }
             if (next.length) setAgentState({ attachments: merged });
         } catch (error) {
+            if (!isCurrentAgentScope(scope) || error instanceof StaleAgentResponseError) return;
             addMessage({ role: "error", title: rt("imageReadFailed"), text: error instanceof Error ? error.message : rt("imageReadFailed") });
         }
     };
@@ -805,15 +970,18 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     };
 
     const runToolCall = async (endpoint: string, token: string, payload: AgentPendingToolCall) => {
+        const scope = getAgentScope();
+        const sendResult = (body: { requestId: string; result?: unknown; error?: string }) => postToolResult(endpoint, token, clientIdRef.current, body, scope);
         if (isSiteTool(payload.name)) {
             try {
                 addEventLog(toolName(payload.name), payload, payload);
                 const result = await runSiteTool(payload.name, payload.input || {}, navigate, { canvasSnapshot: canvasContextRef.current?.snapshot || null });
-                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, result });
+                await sendResult({ requestId: payload.requestId, result });
                 addEventLog(rt("toolCompleted", { tool: toolName(payload.name) }), result, result);
             } catch (error) {
+                if (error instanceof StaleAgentResponseError) return;
                 const message = error instanceof Error ? error.message : rt("toolExecutionFailed");
-                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error: message });
+                await sendResult({ requestId: payload.requestId, error: message });
             }
             return;
         }
@@ -835,6 +1003,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 const context = canvasContextRef.current;
                 if (!context) throw new Error(rt("openCanvasFirst"));
                 appliedOps = await attachmentNodeOps(endpoint, token, clientIdRef.current, payload.input?.nodes);
+                if (!isCurrentAgentScope(scope)) return;
                 result = context.applyOps(appliedOps);
                 await postState(endpoint, token, clientIdRef.current, result as CanvasAgentSnapshot);
             } else {
@@ -842,11 +1011,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 if (!snapshot) throw new Error(rt("openCanvasFirst"));
                 result = snapshot;
             }
-            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, result });
+            await sendResult({ requestId: payload.requestId, result });
             addEventLog(rt("toolCompleted", { tool: toolName(payload.name) }), result, result);
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             const message = error instanceof Error ? error.message : rt("canvasOperationFailed");
-            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error: message });
+            await sendResult({ requestId: payload.requestId, error: message });
         }
     };
 
@@ -865,16 +1035,18 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         await runToolCall(endpoint, token, tool);
     };
 
-    const decideApproval = async (approval: AgentPendingApproval, decision: "accept" | "acceptForSession" | "decline") => {
+    const decideApproval = async (approval: AgentPendingApproval, decision: string) => {
+        if (!acceptsAgentEvent(approval)) return;
         const current = useAgentStore.getState();
         const pending = current.pendingApprovals.find((item) => item.requestId === approval.requestId);
-        if (!pending || pending.deciding) return;
+        if (!pending || pending.deciding || pending.decisions && !pending.decisions.some((item) => item.value === decision)) return;
         setAgentState({ pendingApprovals: current.pendingApprovals.map((item) => item.requestId === approval.requestId ? { ...item, deciding: decision } : item), activity: rt("submittingApproval") });
         try {
-            await postCodexApproval(endpoint, token, approval.requestId, decision);
+            await postAgentApproval(endpoint, token, approval.requestId, decision);
             const latest = useAgentStore.getState();
             if (latest.pendingApprovals.some((item) => item.requestId === approval.requestId)) setAgentState({ activity: rt("waitingCodexApproval") });
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             const latest = useAgentStore.getState();
             const expired = error instanceof Error && error.message.includes("审批请求已失效");
             const resolved = expired || !latest.pendingApprovals.some((item) => item.requestId === approval.requestId);
@@ -889,11 +1061,13 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     };
 
     const changePermissionMode = (nextMode: AgentPermissionMode) => {
+        const scope = getAgentScope();
         const apply = () => {
-            localStorage.setItem("canvas-agent-permission-mode", nextMode);
-            setAgentState({ permissionMode: nextMode });
+            if (!isCurrentAgentScope(scope)) return;
+            preferences.setItem(enginePreferenceKey(engineId, "permission"), nextMode);
+            setAgentState({ permissionMode: nextMode, permissionChanged: true });
         };
-        if (nextMode !== "full") return apply();
+        if (engineId !== "codex" || nextMode !== "full") return apply();
         modal.confirm({
             title: rt("enableFullAccess"),
             content: rt("fullAccessDescription"),
@@ -902,6 +1076,57 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             cancelText: t("common.cancel"),
             onOk: apply,
         });
+    };
+
+    const switchEngine = async (nextEngineId: AgentEngineId) => {
+        const current = useAgentStore.getState();
+        if (!current.connected || nextEngineId === current.engineId || agentIsBusy(current)) return;
+        const scope = getAgentScope();
+        const operation = Symbol();
+        engineSwitchOperationRef.current = operation;
+        setAgentState({ switchingEngine: true });
+        try {
+            const result = await activateAgentEngine(endpoint, token, nextEngineId, clientIdRef.current);
+            if (engineSwitchOperationRef.current !== operation || !isCurrentAgentScope(scope)) return;
+            applyEngineResult(result);
+        } catch (error) {
+            if (engineSwitchOperationRef.current === operation && isCurrentAgentScope(scope)) message.error(error instanceof Error ? error.message : t("agentEngines.switchFailed"));
+        } finally {
+            if (engineSwitchOperationRef.current === operation) {
+                engineSwitchOperationRef.current = null;
+                setAgentState({ switchingEngine: false });
+            }
+        }
+    };
+
+    const manageSettings = async () => {
+        if (agentIsBusy(useAgentStore.getState())) return;
+        try { await openAgentSettings(endpoint, token); settingsOpenedRef.current = true; }
+        catch (error) { if (!(error instanceof StaleAgentResponseError)) message.error(error instanceof Error ? error.message : t("agentEngines.settingsFailed")); }
+    };
+
+    const switchConfigProfile = async (profile: DshConfigProfile) => {
+        const current = useAgentStore.getState();
+        if (!current.connected || current.engineId !== "dsh" || current.engines.find((engine) => engine.id === "dsh")?.configProfile === profile || agentIsBusy(current)) return;
+        const scope = getAgentScope();
+        const operation = Symbol();
+        engineSwitchOperationRef.current = operation;
+        setAgentState({ switchingEngine: true });
+        try {
+            const result = await switchDshConfigProfile(endpoint, token, profile, clientIdRef.current);
+            if (engineSwitchOperationRef.current === operation && isCurrentAgentScope(scope)) applyEngineResult(result);
+        } catch (error) {
+            if (engineSwitchOperationRef.current !== operation) return;
+            const latest = useAgentStore.getState();
+            const failureScope = error instanceof AgentApiError ? error.response as { engineId?: string; runtimeId?: string } : null;
+            const currentTargetFailed = latest.connected && latest.engineId === "dsh" && latest.engines.find((engine) => engine.id === "dsh")?.configProfile === profile && failureScope && acceptsAgentEvent(failureScope);
+            if (isCurrentAgentScope(scope) || currentTargetFailed) message.error(error instanceof Error ? error.message : t("agentEngines.configProfileFailed"));
+        } finally {
+            if (engineSwitchOperationRef.current === operation) {
+                engineSwitchOperationRef.current = null;
+                setAgentState({ switchingEngine: false });
+            }
+        }
     };
 
     const toggleAgentConnection = async ({ silent = false }: { silent?: boolean } = {}) => {
@@ -977,6 +1202,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     }, [autoConnect, connected, enabled, urlAgentAutoConnect]);
 
     function clearAgentSession(patch: Parameters<typeof setAgentState>[0] = {}) {
+        invalidateAgentScope();
         loadThreadsSequenceRef.current += 1;
         threadMessagesRef.current.clear();
         authoritativeHistoryTurnsRef.current.clear();
@@ -992,6 +1218,9 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             loadingThreads: false,
             waiting: false,
             sending: false,
+            stopping: false,
+            draftingSkill: false,
+            switchingEngine: false,
             fragmentBootstrap: false,
             pendingTool: null,
             pendingApprovals: [],
@@ -1024,11 +1253,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         clearSkillSelection();
         setAgentState({ activeTab: "chat", activity: rt("creatingConversation") });
         try {
-            const result = await fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, "/agent/codex/threads/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: clientIdRef.current, permissionMode }) });
+            const result = await fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, `/agent/${engineId}/threads/reset`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: clientIdRef.current, ...(permissionMode ? { permissionMode } : {}) }) });
             if (threadOperationRef.current !== operation) return;
             if (result.conversation) applyConversationState(result.conversation);
             setAgentState({ activeTab: "chat", activity: rt("newConversation") });
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             const state = agentErrorState(error);
             if (state) applyConversationState(state);
             addEventLog(rt("newConversationFailed"), error);
@@ -1044,11 +1274,13 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         if (!current.connected || !threadId || current.sending || current.waiting || current.loadingThreads || ["preparing", "running"].includes(current.conversation.status)) return;
         const operation = beginThreadOperation();
         try {
-            const result = await fetchAgentJson<AgentThreadResponse>(endpoint, token, `/agent/codex/threads/${encodeURIComponent(threadId)}/resume`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ permissionMode, clientId: clientIdRef.current }) });
+            const result = await fetchAgentJson<AgentThreadResponse>(endpoint, token, `/agent/${engineId}/threads/${encodeURIComponent(threadId)}/resume`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...(engineId === "codex" && permissionMode ? { permissionMode } : {}), clientId: clientIdRef.current }) });
+            setAgentState({ modelChanged: false, permissionChanged: false });
             if (result.conversation) applyConversationState(result.conversation);
             await loadThreads();
             if (useAgentStore.getState().activeThreadId === threadId) setAgentState({ activeTab: "chat", activity: rt("conversationResumed") });
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             const state = agentErrorState(error);
             if (state) applyConversationState(state);
             addEventLog(rt("resumeConversationFailed"), error);
@@ -1065,13 +1297,14 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         let deletedCount = 0;
         try {
             for (const threadId of new Set(threadIds)) {
-                await fetchAgentJson(endpoint, token, `/agent/codex/threads/${encodeURIComponent(threadId)}/delete`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: clientIdRef.current }) });
+                await fetchAgentJson(endpoint, token, `/agent/${engineId}/threads/${encodeURIComponent(threadId)}/delete`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: clientIdRef.current }) });
                 threadMessagesRef.current.delete(threadId);
                 deletedCount += 1;
             }
             await loadThreads();
             message.success(rt("recordsDeleted", { count: deletedCount }));
         } catch (error) {
+            if (error instanceof StaleAgentResponseError) return;
             await loadThreads();
             addEventLog(rt("deleteConversationFailed"), error);
             message.error(error instanceof Error ? error.message : rt("deleteConversationFailed"));
@@ -1081,13 +1314,14 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     };
 
     const confirmDeleteThreads = (threadIds: string[]) => {
+        const scope = getAgentScope();
         modal.confirm({
             title: rt("deleteConversations", { count: threadIds.length }),
             content: rt("deleteConversationsDescription"),
             okText: t("common.delete"),
             okType: "danger",
             cancelText: t("common.cancel"),
-            onOk: () => deleteThreads(threadIds),
+            onOk: () => { if (isCurrentAgentScope(scope)) return deleteThreads(threadIds); },
         });
     };
 
@@ -1204,6 +1438,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     };
 
     const handleAgentEvent = async (event: AgentEventPayload) => {
+        const requestScope = getAgentScope();
         if (event.type === "usage.updated") setAgentState({ tokenUsage: eventUsage(event) });
         const log = event.replayed ? null : formatAgentEventLog(event);
         const activity = formatAgentActivity(event);
@@ -1256,6 +1491,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         }
         if (!event.replayed && event.type === "item.completed" && event.item?.type === "image_generation" && event.item.id && event.sourceClientId === clientIdRef.current) {
             const generated = await importGeneratedImages(endpoint, token, event.item);
+            if (!isCurrentAgentScope(requestScope)) return;
             if (generated.length) {
                 const context = canvasContextRef.current;
                 if (context) {
@@ -1315,6 +1551,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
 
     const connectionStatus = t(connectError ? "agent.status.failed" : connected ? "agent.status.connected" : enabled ? "agent.status.connecting" : "agent.status.disconnected");
     const connectionStatusColor = connectError ? "#dc2626" : connected ? "#16a34a" : enabled ? "#d97706" : theme.node.muted;
+    let engineSwitchHint = t("agentEngines.select");
+    if (!connected) engineSwitchHint = t("agentEngines.connectFirst");
+    else if (conversation.status === "preparing") engineSwitchHint = t("agentEngines.initializing", { engine: currentEngine?.name || "Codex" });
+    else if (engineBusy) engineSwitchHint = t("agentEngines.busy");
     const content = (
         <>
             <AgentPanelTabs
@@ -1325,7 +1565,15 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                         <span className="grid size-8 place-items-center">
                             <Bot className="size-4" />
                         </span>
-                        <div className="hidden text-base font-semibold leading-5 @min-[560px]:block">Agent</div>
+                        <Tooltip title={engineSwitchHint} placement="bottom">
+                            <span className="inline-flex">
+                                <Dropdown trigger={["click"]} disabled={!connected || engineBusy} menu={{ selectedKeys: [engineId], items: engines.map((engine) => ({ key: engine.id, label: engine.name, onClick: () => void switchEngine(engine.id) })) }}>
+                                    <button type="button" disabled={!connected || engineBusy} aria-label={t("agentEngines.select")} className="flex h-8 items-center gap-1 rounded px-1 text-sm font-semibold hover:bg-black/5 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-white/10">
+                                        {switchingEngine ? <span>{t("agentEngines.switching")}</span> : currentEngine?.name || "Codex"}<ChevronDown className="size-3 opacity-60" />
+                                    </button>
+                                </Dropdown>
+                            </span>
+                        </Tooltip>
                         <Tooltip title={t("agent.panel.connectionSettings", { status: connectionStatus })} placement="bottom">
                             <Button size="small" type="text" className="!h-8 !w-8 !min-w-8 !px-0 @min-[560px]:!w-auto @min-[560px]:!min-w-0 @min-[560px]:!px-[7px]" aria-label={t("agent.panel.connectionSettingsLabel", { status: connectionStatus })} icon={<PlugZap className="size-3.5" style={{ color: connectionStatusColor }} />} onClick={() => setAgentState({ activeTab: "setup" })}>
                                 <span className="hidden @min-[560px]:inline">{connectionStatus}</span>
@@ -1345,6 +1593,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 }}
                 right={
                     <>
+                        {currentEngine?.capabilities.manageSettings ? <Tooltip title={t("agentEngines.settings")}><Button size="small" type="text" className="!h-8 !w-8 !min-w-8 !px-0" disabled={!connected || engineBusy} aria-label={t("agentEngines.settings")} icon={<Settings className="size-3.5" />} onClick={() => void manageSettings()} /></Tooltip> : null}
                         <Tooltip title={t("agent.history.newThread")} placement="bottom">
                             <Button size="small" type="text" className="!h-8 !w-8 !min-w-8 !px-0 @min-[560px]:!w-auto @min-[560px]:!min-w-0 @min-[560px]:!px-[7px]" aria-label={t("agent.history.newThread")} disabled={!connected || loadingThreads || sending || waiting || conversationBusy} icon={<Plus className="size-3.5" />} onClick={startNewThread}>
                                 <span className="hidden @min-[560px]:inline">{t("agent.history.newThread")}</span>
@@ -1369,17 +1618,19 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                     onUrlChange={(url) => setAgentState({ url, connectError: "" })}
                     onTokenChange={(token) => setAgentState({ token, connectError: "" })}
                     onToggleEnabled={toggleAgentConnection}
+                    onConfigProfileChange={(profile) => void switchConfigProfile(profile)}
                 />
             ) : activeTab === "skills" ? (
-                <AgentSkillsView clientId={clientIdRef.current} />
+                <AgentSkillsView key={`${engineId}:${runtimeId}`} clientId={clientIdRef.current} />
             ) : activeTab === "history" ? (
                 <AgentHistoryView
+                    key={`${engineId}:${runtimeId}`}
                     theme={theme}
                     threads={threads}
                     activeThreadId={activeThreadId}
                     workspacePath={workspacePath}
                     loading={loadingThreads}
-                    busy={sending || waiting || conversationBusy}
+                    busy={engineBusy}
                     connected={connected}
                     onRefresh={() => void loadThreads()}
                     onNewThread={() => void startNewThread()}
@@ -1388,6 +1639,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 />
             ) : activeTab === "log" ? (
                 <AgentLogView
+                    key={`${engineId}:${runtimeId}`}
                     logs={eventLogs}
                     theme={theme}
                     context={{ endpoint, connected, enabled, activity, waiting, sending, messages: messageCount, pendingTool: pendingTool?.name }}
@@ -1397,24 +1649,25 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 />
             ) : (
                 <>
-                    <AgentChatTimeline theme={theme} pendingTool={pendingTool} pendingApprovals={pendingApprovals} sending={sending} waiting={waiting} onRejectTool={rejectPendingTool} onApproveTool={approvePendingTool} onApprovalDecision={decideApproval} />
+                    <AgentChatTimeline key={`${engineId}:${runtimeId}`} theme={theme} pendingTool={pendingTool} pendingApprovals={pendingApprovals} sending={sending} waiting={waiting} onRejectTool={rejectPendingTool} onApproveTool={approvePendingTool} onApprovalDecision={decideApproval} />
                     <AgentTaskProgress theme={theme} busy={sending || waiting} />
                     {tokenUsage ? <AgentUsageBar usage={tokenUsage} theme={theme} /> : null}
                     <AgentChatComposer
+                        key={`${engineId}:${runtimeId}`}
                         prompt={prompt}
                         attachments={attachments.map((attachment) => agentAttachmentToChatAttachment(attachment, endpoint, token))}
-                        disabled={!connected || !conversationReady || loadingThreads}
+                        disabled={!connected || !conversationReady || engineBusy}
                         sending={sending || waiting}
                         placeholder={conversation.status === "idle" || conversation.status === "preparing"
                             ? t("agent.panel.mcpInitializing")
                             : conversation.status === "failed"
-                                ? t("agent.panel.initFailed")
-                                : t("agent.panel.placeholder")}
+                                ? t("agentEngines.initFailed")
+                                : t("agentEngines.placeholder", { engine: currentEngine?.name || "Codex" })}
                         theme={theme}
                         onPromptChange={(prompt) => setAgentState({ prompt })}
                         onSubmit={sendPrompt}
                         onStop={stopTurn}
-                        onAddFiles={addAttachments}
+                        onAddFiles={currentEngine?.capabilities.attachments ? addAttachments : undefined}
                         onRemoveAttachment={removeAttachment}
                         confirmTools={confirmTools}
                         onConfirmToolsChange={(confirmTools) => setAgentState({ confirmTools })}
@@ -1424,16 +1677,16 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                         model={model}
                         reasoningEffort={reasoningEffort}
                         onModelChange={(model) => {
-                            const selected = models.find((item) => item.model === model);
+                            const selected = models.find((item) => (item.id || item.model) === model);
                             if (!selected) return;
-                            const effort = selected.defaultReasoningEffort || selected.supportedReasoningEfforts[0]?.reasoningEffort;
-                            localStorage.setItem("canvas-agent-model", model);
-                            if (effort) localStorage.setItem("canvas-agent-reasoning-effort", effort);
-                            setAgentState({ model, ...(effort ? { reasoningEffort: effort } : {}) });
+                            const effort = selected.defaultReasoningEffort || selected.supportedReasoningEfforts[0]?.reasoningEffort || "";
+                            preferences.setItem(enginePreferenceKey(engineId, "model"), model);
+                            preferences.setItem(enginePreferenceKey(engineId, "effort"), effort);
+                            setAgentState({ model, reasoningEffort: effort, modelChanged: true });
                         }}
                         onReasoningEffortChange={(reasoningEffort) => {
-                            localStorage.setItem("canvas-agent-reasoning-effort", reasoningEffort);
-                            setAgentState({ reasoningEffort });
+                            preferences.setItem(enginePreferenceKey(engineId, "effort"), reasoningEffort);
+                            setAgentState({ reasoningEffort, modelChanged: true });
                         }}
                         left={
                             attachments.length ? (

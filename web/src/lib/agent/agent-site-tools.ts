@@ -11,9 +11,10 @@ import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { modelOptionLabel, modelOptionName, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore } from "@/stores/use-config-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
+import { getMaintenanceState } from "@/services/storage/maintenance";
 
 // Execute site-level Agent tools in the browser, including canvas lists, workbench generation, prompt search, and asset operations.
-// Their data lives locally in the browser through localforage and Zustand, so this module accesses the relevant stores directly.
+// Business stores select the browser or desktop persistence driver during startup.
 
 export const SITE_TOOL_NAMES = [
     "canvas_list_projects",
@@ -55,6 +56,7 @@ type GenerationStatus = "idle" | "queued" | "running" | "succeeded" | "failed";
 type GenerationStatusItem = { id: string; source: "canvas" | "image" | "video"; status: GenerationStatus; kind?: string; title?: string; prompt?: string; projectId?: string; createdAt?: string; updatedAt?: string; successCount?: number; failCount?: number; error?: string };
 
 export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navigate: NavigateFunction, context: SiteToolContext = {}): Promise<unknown> {
+    if (getMaintenanceState().busy) throw new Error("数据维护中，请完成后重试工具调用");
     switch (name) {
         case "canvas_list_projects":
             return listCanvasProjects(input);

@@ -29,7 +29,7 @@ export function AgentChatTimeline({
     waiting: boolean;
     onRejectTool: () => void;
     onApproveTool: () => void;
-    onApprovalDecision: (approval: AgentPendingApproval, decision: "accept" | "acceptForSession" | "decline") => void;
+    onApprovalDecision: (approval: AgentPendingApproval, decision: string) => void;
 }) {
     const { t } = useTranslation();
     const messages = useAgentStore((state) => state.messages);

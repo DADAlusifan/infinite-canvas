@@ -1,4 +1,5 @@
-import localforage from "localforage";
+import { createStorage } from "@/services/storage/driver";
+import { withStorageActivity } from "@/services/storage/maintenance";
 
 import { runPromptSource, type RawPrompt } from "./prompt-source-runtime";
 import { usePromptSourceStore } from "@/stores/use-prompt-source-store";
@@ -46,7 +47,7 @@ type SourceCache = PromptSourceStatus & {
 };
 
 const cacheTtlMs = 1000 * 60 * 60;
-const promptCacheStore = localforage.createInstance({ name: "infinite-canvas", storeName: "prompt_cache" });
+const promptCacheStore = createStorage("prompt_cache");
 const loadingSources = new Map<string, Promise<PromptSourceRefreshResult>>();
 
 function enabledSources() {
@@ -106,7 +107,7 @@ async function refreshSourceRecord(source: PromptSource): Promise<PromptSourceRe
 function getOrStartRefresh(source: PromptSource) {
     const current = loadingSources.get(source.id);
     if (current) return current;
-    const loading = refreshSourceRecord(source).finally(() => loadingSources.delete(source.id));
+    const loading = withStorageActivity(() => refreshSourceRecord(source)).finally(() => loadingSources.delete(source.id));
     loadingSources.set(source.id, loading);
     return loading;
 }

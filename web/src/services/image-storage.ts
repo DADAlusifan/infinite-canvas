@@ -1,4 +1,6 @@
-import localforage from "localforage";
+import { startStorageActivity } from "@/services/storage/maintenance";
+import { createStorage } from "@/services/storage/driver";
+import { desktopBlobUrl, isDesktop } from "@/services/desktop/runtime";
 
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
@@ -14,10 +16,10 @@ export type UploadedImage = {
     mimeType: string;
 };
 
-const store = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
-const previewStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_previews" });
-const imageLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
-const videoLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
+const store = createStorage("image_files");
+const previewStore = createStorage("image_previews");
+const imageLogStore = createStorage("image_generation_logs");
+const videoLogStore = createStorage("video_generation_logs");
 const objectUrls = new Map<string, string>();
 const previewUrls = new Map<string, string>();
 const previewListeners = new Set<() => void>();
@@ -35,18 +37,21 @@ type StoredImagePreview = { version: number; blob?: Blob };
 type ImageReadOptions = { signal?: AbortSignal };
 
 export async function uploadImage(input: string | Blob, options?: ImageReadOptions): Promise<UploadedImage> {
-    if (typeof input !== "string") return storeImage(input, options);
-
-    let blob: Blob;
+    const finishActivity = startStorageActivity();
     try {
-        blob = await fetchImageBlob(input, options);
-    } catch (error) {
-        if (options?.signal?.aborted || isNamedError(error, IMAGE_RESPONSE_ERROR) || isNamedError(error, IMAGE_TIMEOUT_ERROR) || !/^https?:\/\//i.test(input)) throw error;
-        const meta = await loadImageMeta(input, options, IMAGE_REMOTE_LOAD_TIMEOUT_MS);
-        if (!meta) throw error;
-        return { url: input, width: meta.width, height: meta.height, bytes: 0, mimeType: "" };
-    }
-    return storeImage(blob, options);
+        if (typeof input !== "string") return await storeImage(input, options);
+
+        let blob: Blob;
+        try {
+            blob = await fetchImageBlob(input, options);
+        } catch (error) {
+            if (isDesktop() || options?.signal?.aborted || isNamedError(error, IMAGE_RESPONSE_ERROR) || isNamedError(error, IMAGE_TIMEOUT_ERROR) || !/^https?:\/\//i.test(input)) throw error;
+            const meta = await loadImageMeta(input, options, IMAGE_REMOTE_LOAD_TIMEOUT_MS);
+            if (!meta) throw error;
+            return { url: input, width: meta.width, height: meta.height, bytes: 0, mimeType: "" };
+        }
+        return await storeImage(blob, options);
+    } finally { finishActivity(); }
 }
 
 async function storeImage(blob: Blob, options?: ImageReadOptions): Promise<UploadedImage> {
@@ -58,9 +63,11 @@ async function storeImage(blob: Blob, options?: ImageReadOptions): Promise<Uploa
         throwIfAborted(options?.signal);
         await store.setItem(storageKey, blob);
         throwIfAborted(options?.signal);
-        objectUrls.set(storageKey, url);
+        const resultUrl = isDesktop() ? desktopBlobUrl("image_files", storageKey) : url;
+        objectUrls.set(storageKey, resultUrl);
         await storeImagePreview(storageKey, blob);
-        return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type.startsWith("image/") ? blob.type : "" };
+        if (isDesktop()) URL.revokeObjectURL(url);
+        return { url: resultUrl, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type.startsWith("image/") ? blob.type : "" };
     } catch (error) {
         URL.revokeObjectURL(url);
         await store.removeItem(storageKey).catch(() => undefined);
@@ -142,6 +149,7 @@ function throwIfAborted(signal?: AbortSignal) {
 
 export async function resolveImageUrl(storageKey?: string, fallback = "") {
     if (!storageKey) return fallback;
+    if (isDesktop()) return desktopBlobUrl("image_files", storageKey);
     const cached = objectUrls.get(storageKey);
     if (cached) return cached;
     const blob = await store.getItem<Blob>(storageKey);
@@ -217,7 +225,7 @@ export async function setImageBlob(storageKey: string, blob: Blob) {
     await store.setItem(storageKey, blob);
     await deleteImagePreview(storageKey);
     await storeImagePreview(storageKey, blob);
-    const url = URL.createObjectURL(blob);
+    const url = isDesktop() ? desktopBlobUrl("image_files", storageKey) : URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
     return url;
 }
@@ -229,6 +237,7 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
 }
 
 export async function deleteStoredImages(keys: Iterable<string>) {
+    if (isDesktop()) return;
     await Promise.all(
         Array.from(new Set(keys)).map(async (key) => {
             const url = objectUrls.get(key);
@@ -241,6 +250,7 @@ export async function deleteStoredImages(keys: Iterable<string>) {
 }
 
 export async function cleanupUnusedImages(usedData: unknown) {
+    if (isDesktop()) return;
     const usedKeys = collectImageStorageKeys(usedData);
     await Promise.all([
         imageLogStore.iterate((value) => {

@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import { refreshDueSources } from "@/services/api/prompts";
 import { usePromptSourceStore } from "@/stores/use-prompt-source-store";
+import { getMaintenanceState } from "@/services/storage/maintenance";
 
 const CHECK_INTERVAL_MS = 60_000;
 
@@ -15,7 +16,7 @@ export function usePromptSourceScheduler() {
         if (!intervalMinutes) return;
         let running = false;
         const tick = async () => {
-            if (running) return;
+            if (running || getMaintenanceState().busy) return;
             const { updateSchedule } = usePromptSourceStore.getState();
             running = true;
             try {

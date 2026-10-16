@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 
-import { runClaudeTurn } from "../agent/claude.js";
+import { CODEX_ENGINE, isAgentEngine } from "../agent/engine.js";
 import { archiveCodexThread, CodexSkillLookupError, configureCodexSkill, generateCodexSkillDraft, interruptCodexTurn, isRecoverableThreadError, listCodexModels, listCodexSkills, listCodexThreads, readCodexThread, resolveCodexApproval, resolveCodexSkill, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread } from "../agent/codex.js";
 import type { CodexReasoningEffort, CodexSkillSelector } from "../agent/codex-protocol.js";
 import { messageMetadataStore } from "../agent/message-metadata.js";
@@ -13,6 +13,8 @@ import { DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWo
 import { logger } from "../utils/logger.js";
 import { checkVersions } from "../version-check.js";
 import { SkillStore, SkillStoreError } from "../skills/store.js";
+import { DshController } from "./dsh.js";
+import { agentRequestScope } from "./agent-scope.js";
 
 /** 启动仅监听本机的 Canvas Agent HTTP 服务。 */
 export function startHttpServer() {
@@ -23,9 +25,26 @@ export function startHttpServer() {
 
     const initialWorkspace = ensureSiteWorkspace(config);
     const session = new CanvasSession(initialWorkspace.activeThreadId || "");
+    const dsh = new DshController({ config, session, descriptorsChanged: () => {
+        session.setEngineDescriptors([CODEX_ENGINE, dsh.descriptor()]);
+        session.emitAll("engine_changed", {
+            ...session.engineSnapshot,
+            workspace: session.scope.engineId === "dsh" ? dsh.workspace() : ensureSiteWorkspace(config),
+            conversation: session.conversationStateSnapshot,
+        });
+    } });
+    session.setEngineDescriptors([CODEX_ENGINE, dsh.descriptor()]);
+    if (config.activeEngineId === "dsh") session.selectEngine("dsh", config.dsh?.activeThreadId || "");
+    // Owned MCP subprocesses inherit a fixed engine identity, not whichever tab happens to be active later.
+    process.env.CANVAS_AGENT_ENGINE_ID = "codex";
+    process.env.CANVAS_AGENT_RUNTIME_ID = session.runtimeFor("codex");
+    process.env.CANVAS_AGENT_URL = config.url;
+    process.env.CANVAS_AGENT_TOKEN = config.token;
+    const codexScope = { engineId: "codex" as const, runtimeId: session.runtimeFor("codex") };
     const skillStore = new SkillStore(initialWorkspace.workspacePath);
     /** 将 Agent 事件广播到所属线程或全部网页。 */
     const emit = (type: string, payload: unknown) => {
+        if (!session.matchesScope(codexScope)) return;
         const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
         if (type === "skills_changed") {
             session.emitAll(type, value);
@@ -35,24 +54,25 @@ export function startHttpServer() {
             if (value.type === "mcp.startup") session.updateConversationMcp(String(value.name || ""), startupStatus(value.status), String(value.error || "") || null, String(value.failureReason || "") || null);
             if (value.type === "mcp.complete") session.completeConversationMcpInventory(mcpInventory(value.services));
         }
-        const scope = session.codexBusy ? session.codexEventScope : { threadId: "", turnId: "", sourceClientId: "" };
+        const scope = session.agentBusy ? session.eventScope : { threadId: "", turnId: "", sourceClientId: "" };
         const threadId = String(value.threadId || value.thread_id || scope.threadId || ensureSiteWorkspace(config).activeThreadId || "");
         const turnId = String(value.turnId || value.turn_id || scope.turnId || "");
         const sourceClientId = String(value.sourceClientId || scope.sourceClientId || "");
         const data = {
             ...value,
+            ...codexScope,
             ...(threadId ? { threadId, thread_id: threadId } : {}),
             ...(turnId ? { turnId, turn_id: turnId } : {}),
             ...(sourceClientId ? { sourceClientId } : {}),
         };
-        session.trackCodexEvent(type, data);
+        session.trackEvent(type, data);
         threadId ? session.emitThread(type, threadId, data) : session.emitAll(type, data);
     };
     /** 保存并广播当前站点工作空间的活跃线程。 */
     const setActiveThread = (activeThreadId: string, payload: Record<string, unknown> = {}, preserveConversation = false) => {
         const workspace = updateSiteWorkspace(config, { activeThreadId: activeThreadId || undefined });
         if (!preserveConversation) session.activateConversation(activeThreadId, String(payload.sourceClientId || "") || undefined);
-        if (!session.codexBusy && session.codexThreadId !== activeThreadId) session.setCodexState({ threadId: activeThreadId, turnId: "" });
+        if (!session.agentBusy && session.agentThreadId !== activeThreadId) session.setRunState({ threadId: activeThreadId, turnId: "" });
         session.emitThread("workspace_changed", activeThreadId, { ...payload, activeThreadId, conversation: session.conversationStateSnapshot });
         return workspace;
     };
@@ -102,8 +122,10 @@ export function startHttpServer() {
         emit("agent_bootstrap", { type: "codex.prepare_failed", threadId, sourceClientId: clientId || undefined, error: text });
     };
     const app = express();
+    let shuttingDown = false;
     app.disable("x-powered-by");
     app.use(express.json({ limit: "30mb" }));
+    app.use((_req, res, next) => shuttingDown ? void res.status(503).json({ ok: false, error: "Agent 正在退出，请等待收尾完成" }) : next());
     app.use((req, res, next) => {
         if (!logger.enabled) return next();
         const startedAt = Date.now();
@@ -126,8 +148,40 @@ export function startHttpServer() {
         if (validToken(req, requestUrl(req, config), config.token)) return next();
         res.status(401).json({ ok: false, error: "invalid token" });
     });
+    app.use(agentRequestScope(session));
+    app.get("/agent/engines", (_req, res) => res.json({ ok: true, ...session.engineSnapshot }));
+    app.post("/agent/engines/:engineId/activate", route(async (req, res) => {
+        const engineId = routeParam(req.params.engineId);
+        if (!isAgentEngine(engineId)) return res.status(400).json({ ok: false, error: "未知 Agent 引擎" });
+        if (!session.hasClient(String(req.body?.clientId || ""))) return res.status(409).json({ ok: false, error: "发起切换的页面已断开" });
+        if (!req.body?.expectedEngineId || !req.body?.runtimeId || !session.matchesScope({ engineId: req.body?.expectedEngineId, runtimeId: req.body?.runtimeId })) return res.status(409).json({ ok: false, code: "ENGINE_STALE", error: "Agent 已在其他页面切换", ...session.engineSnapshot });
+        if (!session.beginMutation()) return res.status(409).json({ ok: false, code: "CONVERSATION_BUSY", error: "请等待 Agent 任务、审批或初始化完成" });
+        try {
+            const threadId = engineId === "codex" ? ensureSiteWorkspace(config).activeThreadId || "" : config.dsh?.activeThreadId || "";
+            session.selectEngine(engineId, threadId);
+            config.activeEngineId = engineId;
+            saveConfig(config);
+            session.emitAll("engine_changed", { ok: true, ...session.engineSnapshot, workspace: engineId === "dsh" ? dsh.workspace() : ensureSiteWorkspace(config), conversation: session.conversationStateSnapshot });
+            if (engineId === "dsh") await dsh.prepare(String(req.body.clientId));
+            else if (threadId) await prepareExistingThread(threadId, String(req.body.clientId));
+            else {
+                session.beginConversation({ sourceClientId: String(req.body.clientId) });
+                await prepareDraftThread(String(req.body.clientId), "request");
+            }
+        } catch (error) {
+            session.failConversationPreparation(error instanceof Error ? error.message : String(error));
+            throw error;
+        } finally {
+            session.endMutation();
+            session.emitAll("engine_changed", { ok: true, ...session.engineSnapshot, workspace: session.scope.engineId === "dsh" ? dsh.workspace() : ensureSiteWorkspace(config), conversation: session.conversationStateSnapshot });
+        }
+        const workspace = engineId === "codex" ? ensureSiteWorkspace(config) : dsh.workspace();
+        const result = { ok: true, ...session.engineSnapshot, workspace, conversation: session.conversationStateSnapshot };
+        session.emitAll("engine_changed", result);
+        res.json(result);
+    }));
     app.get("/events", (req, res) => {
-        session.openEvents(requestUrl(req, config), res, ensureSiteWorkspace(config).activeThreadId || "");
+        session.openEvents(requestUrl(req, config), res, session.scope.engineId === "dsh" ? config.dsh?.activeThreadId || "" : ensureSiteWorkspace(config).activeThreadId || "");
     });
     app.post("/canvas/state", (req, res) => {
         session.updateState(req.body, String(req.query.clientId || "") || undefined);
@@ -148,7 +202,7 @@ export function startHttpServer() {
         res.setHeader("Cache-Control", "no-store");
         res.type(attachment.type).send(Buffer.from(data, "base64"));
     }));
-    app.get("/agent/message-assets/:messageKey/:assetFile", route(async (req, res) => {
+    app.get(["/agent/message-assets/:messageKey/:assetFile", "/agent/codex/message-assets/:messageKey/:assetFile"], route(async (req, res) => {
         const asset = await messageMetadataStore.readAsset(routeParam(req.params.messageKey), routeParam(req.params.assetFile));
         if (!asset) return void res.status(404).json({ ok: false, error: "message asset not found" });
         res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
@@ -169,7 +223,19 @@ export function startHttpServer() {
         res.setHeader("Cache-Control", "no-store");
         res.type(path.extname(filePath)).send(await readFile(filePath));
     }));
-    app.post("/api/tools", route(async (req, res) => res.json({ ok: true, result: await session.callTool(req.body?.name, req.body?.input || {}) })));
+    app.post("/api/tools", route(async (req, res) => {
+        const controller = new AbortController();
+        const aborted = () => { if (!res.writableEnded) controller.abort(new Error("工具调用已取消")); };
+        res.once("close", aborted);
+        try {
+            const scope = { engineId: req.body?.engineId || "codex", runtimeId: req.body?.runtimeId };
+            if ((scope.engineId === "dsh" && !session.agentBusy) || (session.agentBusy && !scope.runtimeId)) {
+                return void res.status(409).json({ ok: false, error: "画布工具必须属于侧栏当前运行的任务" });
+            }
+            const result = await session.callTool(req.body?.name, req.body?.input || {}, { scope, signal: controller.signal });
+            res.json({ ok: true, result });
+        } finally { res.removeListener("close", aborted); }
+    }));
     app.get("/agent/codex/workspace", (_req, res) => {
         const workspace = ensureSiteWorkspace(config);
         res.json({ ok: true, workspace, conversation: session.conversationStateSnapshot });
@@ -188,7 +254,7 @@ export function startHttpServer() {
         if (!clientId || !session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起提炼的网页已断开，请重新连接后再试" });
         const model = String(req.body?.model || "") || undefined;
         const effort = reasoningEffort(req.body?.effort);
-        const previousCodexState = session.codexStateSnapshot;
+        const previousAgentRunState = session.runStateSnapshot;
         skillDraftRunning = true;
         try {
             if (source === "conversation") {
@@ -197,20 +263,20 @@ export function startHttpServer() {
                 if (threadId !== (workspace.activeThreadId || "")) return res.status(409).json({ ok: false, error: "当前对话已在其他页面切换，请同步后重试" });
                 const history = await readCodexThread(emit, threadId, workspace.workspacePath);
                 if (!history.messages.some((message) => message.role === "user" && message.turnId)) return res.status(409).json({ ok: false, error: "当前对话还没有可提炼的已完成内容" });
-                session.setCodexState({ busy: true, threadId, turnId: "" }, { preserveReplay: true });
+                session.setRunState({ busy: true, threadId, turnId: "" }, { preserveReplay: true });
                 const data = await generateCodexSkillDraft(emit, workspace.workspacePath, { source, threadId, model, effort });
                 if (!session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起提炼的网页已断开，请重新连接后再试" });
                 return res.json({ ok: true, data });
             }
             const snapshot = session.canvasStateForClient(clientId);
             if (!snapshot || (snapshot as Record<string, unknown>).hasCanvas === false) return res.status(409).json({ ok: false, error: "当前页面没有可提炼的画布" });
-            session.setCodexState({ busy: true, threadId: workspace.activeThreadId || "", turnId: "" }, { preserveReplay: true });
+            session.setRunState({ busy: true, threadId: workspace.activeThreadId || "", turnId: "" }, { preserveReplay: true });
             const data = await generateCodexSkillDraft(emit, workspace.workspacePath, { source, snapshot, model, effort });
             if (!session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起提炼的网页已断开，请重新连接后再试" });
             return res.json({ ok: true, data });
         } finally {
             skillDraftRunning = false;
-            session.setCodexState(previousCodexState, { preserveReplay: true });
+            session.setRunState(previousAgentRunState, { preserveReplay: true });
         }
     }));
     app.get("/agent/codex/skills/:name", route(async (req, res) => {
@@ -267,7 +333,7 @@ export function startHttpServer() {
     app.post("/agent/codex/history/ack", (req, res) => {
         const threadId = String(req.body?.threadId || "");
         const turnIds = Array.isArray(req.body?.turnIds) ? req.body.turnIds.map(String) : [];
-        session.acknowledgeCodexHistory(threadId, turnIds);
+        session.acknowledgeHistory(threadId, turnIds);
         res.json({ ok: true });
     });
     app.post("/agent/codex/threads/:threadId/resume", codexMutation(async (req, res) => {
@@ -317,7 +383,7 @@ export function startHttpServer() {
         logger.info("Codex turn accepted", { threadId: req.body?.threadId, model: model || "default", reasoningEffort: effort || "default", promptLength: prompt.length, attachmentCount: attachments.length });
         session.bindClient(clientId);
         session.markConversationRunning(threadId);
-        session.setCodexState({ busy: true, threadId, turnId: "" });
+        session.setRunState({ busy: true, threadId, turnId: "" });
         try {
             let turnId = "";
             const attachmentRefs = session.setTurnAttachments(clientId, attachments);
@@ -358,7 +424,7 @@ export function startHttpServer() {
                         setActiveThread(threadId, { emptyThread: true, sourceClientId: clientId });
                     }
                     session.markConversationRunning(threadId);
-                    session.setCodexState({ busy: true, threadId, turnId: "" });
+                    session.setRunState({ busy: true, threadId, turnId: "" });
                     if (threadChanged) {
                         session.emitThread("chat_message", threadId, {
                             sourceClientId: clientId,
@@ -378,14 +444,15 @@ export function startHttpServer() {
                         });
                     }
                     logger.info("Codex turn started", { threadId, turnId, model: model || "default", reasoningEffort: effort || "default" });
-                    session.setCodexState({ busy: true, threadId, turnId });
+                    session.setRunState({ busy: true, threadId, turnId });
                 },
                 onFinish: () => {
                     logger.info("Codex turn finished", { threadId, turnId });
                     if (!turnId) void messageMetadataStore.remove(messageId, threadId).catch((error) => logger.warn("Failed to remove unbound message metadata", { clientMessageId: messageId, error }));
+                    session.cancelPendingTools();
                     session.clearTurnAttachments(clientId);
                     if (clientId) session.releaseClient(clientId);
-                    session.setCodexState({ busy: false, threadId, turnId });
+                    session.setRunState({ busy: false, threadId, turnId });
                     session.finishConversationRun(threadId);
                 },
             });
@@ -393,7 +460,7 @@ export function startHttpServer() {
         } catch (error) {
             await messageMetadataStore.remove(messageId, threadId).catch((metadataError) => logger.warn("Failed to remove rejected message metadata", { clientMessageId: messageId, error: metadataError }));
             session.releaseClient(clientId);
-            session.setCodexState({ busy: false, threadId, turnId: "" });
+            session.setRunState({ busy: false, threadId, turnId: "" });
             session.finishConversationRun(threadId);
             throw error;
         }
@@ -402,11 +469,11 @@ export function startHttpServer() {
     /** 将 Codex 写操作串行化，避免多窗口在异步请求期间交叉修改会话。 */
     function codexMutation(handler: (req: Request, res: Response) => unknown | Promise<unknown>) {
         return route(async (req, res) => {
-            if (!session.beginCodexMutation()) return res.status(409).json({ ok: false, code: "CONVERSATION_BUSY", error: "Codex 正在运行或正在切换会话，请稍后重试", state: session.conversationStateSnapshot });
+            if (!session.beginMutation()) return res.status(409).json({ ok: false, code: "CONVERSATION_BUSY", error: "Codex 正在运行或正在切换会话，请稍后重试", state: session.conversationStateSnapshot });
             try {
                 return await handler(req, res);
             } finally {
-                session.endCodexMutation();
+                session.endMutation();
             }
         });
     }
@@ -420,18 +487,17 @@ export function startHttpServer() {
         const ok = await interruptCodexTurn(skillDraftRunning ? undefined : String(req.body?.threadId || ""));
         res.status(ok ? 200 : 409).json({ ok, ...(ok ? {} : { error: "当前没有可停止的任务" }) });
     }));
-    app.post("/agent/claude/turn", (req, res) => {
-        runClaudeTurn(String(req.body?.prompt || ""), emit);
-        res.json({ ok: true });
-    });
+    dsh.register(app);
     app.use((_req, res) => res.status(404).json({ ok: false, error: "not found" }));
     app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
         logger.error("HTTP request failed", { method: req.method, path: req.path, error });
         if (error instanceof SkillStoreError || error instanceof CodexSkillLookupError) return void res.status(error.statusCode).json({ ok: false, error: error.message });
+        const status = (error as Error & { statusCode?: number }).statusCode;
+        if (status === 400 || status === 404 || status === 409) return void res.status(status).json({ ok: false, error: error.message });
         res.status(500).json({ ok: false, error: error.message });
     });
 
-    app.listen(port, "127.0.0.1", () => {
+    const server = app.listen(port, "127.0.0.1", () => {
         console.log("Infinite Canvas Agent");
         checkVersions();
         console.log(`Local URL: ${config.url}`);
@@ -442,15 +508,33 @@ export function startHttpServer() {
         if (logger.enabled) console.log(`Debug log: ${logger.filePath}`);
         logger.info("Canvas Agent started", { url: config.url, workspace: ensureSiteWorkspace(config).workspacePath, debugLog: logger.filePath });
         const activeThreadId = initialWorkspace.activeThreadId || "";
-        if (activeThreadId && session.beginCodexMutation()) {
+        if (session.scope.engineId === "codex" && activeThreadId && session.beginMutation()) {
             void prepareExistingThread(activeThreadId).catch(async (error) => {
                 if (!isRecoverableThreadError(error)) return failPreparedConversation(error, activeThreadId);
                 session.beginConversation();
                 setActiveThread("", { emptyThread: true, draftThread: true }, true);
                 await prepareDraftThread("", "request");
-            }).finally(() => session.endCodexMutation()).catch(() => undefined);
+            }).finally(() => session.endMutation()).catch(() => undefined);
+        }
+        if (session.scope.engineId === "dsh" && session.beginMutation()) {
+            void dsh.prepare().catch((error) => logger.error("DSH 初始化失败，原数据已保留", { error }))
+                .finally(() => session.endMutation());
         }
     });
+    const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        void dsh.close().then(() => {
+            server.closeAllConnections();
+            server.close(() => process.exit(0));
+        }).catch((error) => {
+            logger.error("DSH 未能完整收尾，请检查原生会话状态", { error });
+            shuttingDown = false;
+            process.exitCode = 1;
+        });
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
 }
 
 /** 将异步 Express 路由异常交给统一错误处理中间件。 */

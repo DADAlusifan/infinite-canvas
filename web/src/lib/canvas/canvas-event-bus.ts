@@ -1,4 +1,4 @@
-import localforage from "localforage";
+import { createStorage, type DataStore } from "@/services/storage/driver";
 
 import type { PluginStorage } from "@/types/canvas-plugin";
 
@@ -27,12 +27,12 @@ export function onCanvasEvent(event: string, handler: Handler) {
 }
 
 // Private plugin storage isolated by pluginId namespace.
-const stores = new Map<string, LocalForage>();
+const stores = new Map<string, DataStore>();
 
 export function createPluginStorage(pluginId: string): PluginStorage {
     let store = stores.get(pluginId);
     if (!store) {
-        store = localforage.createInstance({ name: "infinite-canvas-plugins", storeName: pluginId });
+        store = createStorage(`plugin:${pluginId}`);
         stores.set(pluginId, store);
     }
     return {

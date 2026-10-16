@@ -4,6 +4,8 @@
   "defaultOpen": true,
   "pages": [
     "local-development",
+    "desktop",
+    "agent-engines",
     "canvas-data-structure",
     "local-codex-canvas"
   ]

@@ -16,3 +16,9 @@ plugins/canvas/*/dist
 plugins/canvas/*/node_modules
 web/public/plugins
 other
+web/src-tauri/target/
+web/src-tauri/gen/schemas/
+# The icon generator also emits mobile/store assets; this target ships only Windows.
+web/src-tauri/icons/*
+!web/src-tauri/icons/icon.ico
+!web/src-tauri/icons/icon.png

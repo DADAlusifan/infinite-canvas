@@ -3,6 +3,7 @@ import { getPluginRuntime } from "@/lib/canvas/plugin-runtime";
 import { usePluginStore, type InstalledPlugin } from "@/stores/canvas/use-plugin-store";
 import type { CanvasPlugin } from "@/types/canvas-plugin";
 import i18n from "@/i18n";
+import { isDesktop } from "@/services/desktop/runtime";
 
 const cleanups = new Map<string, () => void>();
 
@@ -79,7 +80,7 @@ export async function setPluginEnabled(record: InstalledPlugin, enabled: boolean
         return;
     }
     // Reload local plugins from their URL when enabled because the cached source may be stale.
-    const source = record.local ? await fetchPluginSource(withCacheBust(record.url)) : record.source;
+    const source = record.local && !isDesktop() ? await fetchPluginSource(withCacheBust(record.url)) : record.source;
     const plugin = await evaluatePluginSource(source);
     activatePlugin(plugin);
 }
@@ -102,7 +103,7 @@ export async function ensurePluginsLoaded() {
         records.map(async (record) => {
             try {
                 // Local plugins use the latest output; other plugins use their cached source.
-                const source = record.local ? await fetchPluginSource(withCacheBust(record.url)) : record.source;
+                const source = record.local && !isDesktop() ? await fetchPluginSource(withCacheBust(record.url)) : record.source;
                 activatePlugin(await evaluatePluginSource(source));
             } catch (error) {
                 console.error(`[plugin] Failed to load: ${record.id}`, error);
@@ -131,6 +132,7 @@ async function loadLocalPlugins() {
                 const source = await fetchPluginSource(withCacheBust(url));
                 const plugin = await evaluatePluginSource(source);
                 const existing = store.plugins.find((item) => item.id === plugin.id);
+                if (isDesktop() && existing) return;
                 store.upsert({
                     id: plugin.id,
                     name: plugin.name || plugin.id,

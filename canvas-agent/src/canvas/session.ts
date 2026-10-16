@@ -2,16 +2,17 @@ import crypto from "node:crypto";
 import type { ServerResponse } from "node:http";
 
 import type { AgentAttachment } from "../agent/types.js";
+import { CODEX_ENGINE, type AgentEngineDescriptor, type AgentEngineId, type AgentScope } from "../agent/engine.js";
 import { logger } from "../utils/logger.js";
 import { buildCanvasToolRequest, fitAttachmentNodeSize } from "./operations.js";
 import type { ToolName } from "./schemas.js";
 import { compactCanvasState, compactNode, isToolName, nextCanvasX, parseToolInput } from "./tools.js";
 import type { CanvasSnapshot } from "./types.js";
 
-type PendingRequest = { clientId: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
+type PendingRequest = AgentScope & { clientId: string; threadId: string; turnId: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
 type TurnAttachment = { clientId: string; id: string; name: string; type: string; size: number; width: number; height: number; dataUrl: string };
 type ReplayEvent = { type: string; payload: Record<string, unknown> };
-export type CodexState = { busy: boolean; threadId: string; turnId: string };
+export type AgentRunState = { busy: boolean; threadId: string; turnId: string };
 export type McpStartupState = "starting" | "ready" | "failed" | "cancelled";
 export type ConversationState = {
     revision: number;
@@ -23,7 +24,7 @@ export type ConversationState = {
     error?: string;
 };
 type McpInventoryItem = { name: string; authStatus?: string };
-export const AGENT_PROTOCOL_VERSION = 6;
+export const AGENT_PROTOCOL_VERSION = 7;
 
 const SITE_TOOLS = new Set<ToolName>([
     "site_navigate",
@@ -40,19 +41,23 @@ const SITE_TOOLS = new Set<ToolName>([
 
 /** 管理网页画布连接、状态、附件和工具请求。 */
 export class CanvasSession {
+    private activeEngineId: AgentEngineId = "codex";
+    private runtimeIds = { codex: crypto.randomUUID(), dsh: crypto.randomUUID() };
+    private engines: AgentEngineDescriptor[] = [CODEX_ENGINE];
+    private engineStates = new Map<AgentEngineId, { conversation: ConversationState; run: AgentRunState }>();
     private clients = new Map<string, ServerResponse>();
     private clientFocusOrder = new Map<string, number>();
     private pending = new Map<string, PendingRequest>();
     private pendingApprovals = new Map<string, Record<string, unknown>>();
     private canvasStates = new Map<string, CanvasSnapshot>();
     private turnAttachments = new Map<string, TurnAttachment>();
-    private codexReplayEvents = new Map<string, ReplayEvent>();
-    private codexReplayActiveItems = new Set<string>();
-    private codexMutationBusy = false;
+    private replayEvents = new Map<string, ReplayEvent>();
+    private replayActiveItems = new Set<string>();
+    private mutationBusy = false;
     private activeClientId = "";
     private boundClientId = "";
     private focusSequence = 0;
-    private codexState: CodexState = { busy: false, threadId: "", turnId: "" };
+    private agentState: AgentRunState = { busy: false, threadId: "", turnId: "" };
     private conversationState: ConversationState;
     private conversationInventoryComplete = false;
     private preparedConversationThreadId = "";
@@ -79,21 +84,67 @@ export class CanvasSession {
 
     /** 返回 Canvas Agent 当前连接状态。 */
     health() {
-        return { ok: true, protocolVersion: AGENT_PROTOCOL_VERSION, hasCanvas: Boolean(this.canvasState), clients: this.clients.size, codexBusy: this.codexState.busy, conversation: this.conversationStateSnapshot };
+        return { ok: true, protocolVersion: AGENT_PROTOCOL_VERSION, ...this.engineSnapshot, hasCanvas: Boolean(this.canvasState), clients: this.clients.size, conversation: this.conversationStateSnapshot };
     }
 
-    /** 返回 Codex 是否正在执行任务。 */
-    get codexBusy() {
-        return this.codexState.busy;
+    get scope(): AgentScope { return { engineId: this.activeEngineId, runtimeId: this.runtimeIds[this.activeEngineId] }; }
+    runtimeFor(engineId: AgentEngineId) { return this.runtimeIds[engineId]; }
+    get globalBusy() { return this.agentState.busy || this.mutationBusy || this.pending.size > 0 || this.pendingApprovals.size > 0 || this.conversationState.status === "preparing"; }
+    get engineSnapshot() {
+        return { ...this.scope, activeEngineId: this.activeEngineId, engines: this.engines, engine: this.engines.find((engine) => engine.id === this.activeEngineId), globalBusy: this.globalBusy };
+    }
+    setEngineDescriptors(engines: AgentEngineDescriptor[]) { this.engines = engines; }
+
+    restartDshRuntime() {
+        if (this.activeEngineId !== "dsh" || this.agentState.busy || this.pending.size || this.pendingApprovals.size) throw new Error("请先等待当前 DSH 任务和审批完成");
+        this.runtimeIds.dsh = crypto.randomUUID();
+        this.engineStates.delete("dsh");
+        this.agentState = { busy: false, threadId: "", turnId: "" };
+        this.conversationInventoryComplete = false;
+        this.preparedConversationThreadId = "";
+        this.conversationState = { revision: 1, conversationId: crypto.randomUUID(), threadId: "", status: "idle", mcpStatuses: {} };
+        this.replayEvents.clear();
+        this.replayActiveItems.clear();
+        this.boundClientId = "";
+        this.turnAttachments.clear();
     }
 
-    get codexThreadId() {
-        return this.codexState.threadId;
+    /** The coordinator serializes activation; never carry approvals or live tools across engines. */
+    selectEngine(engineId: AgentEngineId, threadId = "") {
+        if (this.agentState.busy || this.pending.size || this.pendingApprovals.size) throw new Error("请先等待当前 Agent 任务和审批完成");
+        if (engineId === this.activeEngineId) return;
+        this.engineStates.set(this.activeEngineId, { conversation: this.conversationStateSnapshot, run: this.runStateSnapshot });
+        this.activeEngineId = engineId;
+        const saved = this.engineStates.get(engineId);
+        this.agentState = saved?.run || { busy: false, threadId, turnId: "" };
+        this.conversationState = saved?.conversation || {
+            revision: 0, conversationId: threadId || crypto.randomUUID(), threadId, status: "idle", mcpStatuses: {},
+        };
+        this.pendingApprovals.clear();
+        this.replayEvents.clear();
+        this.replayActiveItems.clear();
+        this.boundClientId = "";
+        this.turnAttachments.clear();
     }
 
-    /** Return a copy that callers can restore after a temporary Codex operation. */
-    get codexStateSnapshot(): CodexState {
-        return { ...this.codexState };
+    matchesScope(scope: { engineId?: unknown; runtimeId?: unknown }) {
+        return (!scope.engineId || scope.engineId === this.scope.engineId) && (!scope.runtimeId || scope.runtimeId === this.scope.runtimeId);
+    }
+
+    private envelope(payload: unknown) { return { ...recordValue(payload), ...this.scope }; }
+
+    /** 返回当前引擎是否正在执行任务。 */
+    get agentBusy() {
+        return this.agentState.busy;
+    }
+
+    get agentThreadId() {
+        return this.agentState.threadId;
+    }
+
+    /** Return a copy that callers restore after an isolated skill-draft operation. */
+    get runStateSnapshot(): AgentRunState {
+        return { ...this.agentState };
     }
 
     /** 返回站点级对话的权威快照。 */
@@ -198,69 +249,73 @@ export class CanvasSession {
         return this.clients.has(clientId) ? this.canvasStates.get(clientId) || null : null;
     }
 
-    /** 原子取得 Codex 写操作权限，避免多个网页并发切换或修改会话。 */
-    beginCodexMutation() {
-        if (this.codexState.busy || this.codexMutationBusy) return false;
-        this.codexMutationBusy = true;
+    /** 原子取得写操作权限，避免跨引擎或多网页交叉修改会话。 */
+    beginMutation() {
+        if (this.agentState.busy || this.mutationBusy || this.pendingApprovals.size || this.pending.size || this.conversationState.status === "preparing") return false;
+        this.mutationBusy = true;
+        this.emitAll("agent_state", { ...this.agentState, globalBusy: true });
         return true;
     }
 
-    /** 释放 Codex 写操作权限。 */
-    endCodexMutation() {
-        this.codexMutationBusy = false;
+    /** 释放当前写操作权限。 */
+    endMutation() {
+        this.mutationBusy = false;
+        this.emitAll("agent_state", { ...this.agentState, globalBusy: this.globalBusy });
     }
 
-    /** 返回当前 Codex turn 的线程、turn 和发起网页。 */
-    get codexEventScope() {
+    /** 返回当前 turn 的线程、turn 和发起网页。 */
+    get eventScope() {
         return {
-            threadId: this.codexState.threadId,
-            turnId: this.codexState.busy ? this.codexState.turnId : "",
-            sourceClientId: this.codexState.busy ? this.boundClientId : "",
+            threadId: this.agentState.threadId,
+            turnId: this.agentState.busy ? this.agentState.turnId : "",
+            sourceClientId: this.agentState.busy ? this.boundClientId : "",
         };
     }
 
-    /** 返回刷新后仍需展示的 Codex 权限请求。 */
-    get codexPendingApprovals() {
+    /** 返回刷新后仍需展示的权限请求。 */
+    get pendingApprovalSnapshot() {
         return [...this.pendingApprovals.values()];
     }
 
-    /** 跟踪需要跨页面重连恢复的 Codex 权限请求。 */
-    trackCodexEvent(type: string, payload: Record<string, unknown>) {
+    /** 跟踪需要跨页面重连恢复的权限请求。 */
+    trackEvent(type: string, payload: Record<string, unknown>) {
+        const previous = this.pendingApprovals.size;
         const requestId = String(payload.requestId || "");
-        if (type === "codex_approval" && requestId) this.pendingApprovals.set(requestId, payload);
-        if (type === "codex_approval_resolved" && requestId) this.pendingApprovals.delete(requestId);
+        if ((type === "codex_approval" || type === "dsh_approval") && requestId) this.pendingApprovals.set(requestId, payload);
+        if ((type === "codex_approval_resolved" || type === "dsh_approval_resolved") && requestId) this.pendingApprovals.delete(requestId);
         if (type === "agent_error") this.pendingApprovals.clear();
+        if (this.pendingApprovals.size !== previous) this.emitAll("agent_state", { ...this.agentState, globalBusy: this.globalBusy });
     }
 
-    /** 更新并广播 Codex 运行状态；静默后台活动可保留上一 turn 的断线重放。 */
-    setCodexState(patch: Partial<CodexState>, options: { preserveReplay?: boolean } = {}) {
-        const next = { ...this.codexState, ...patch };
-        const threadChanged = next.threadId !== this.codexState.threadId;
-        const turnChanged = Boolean(this.codexState.turnId && next.turnId && next.turnId !== this.codexState.turnId);
-        const nextTurnStarted = !this.codexState.busy && next.busy;
+    /** 更新运行状态；独立后台活动可保留上一 turn 的断线重放。 */
+    setRunState(patch: Partial<AgentRunState>, options: { preserveReplay?: boolean } = {}) {
+        const next = { ...this.agentState, ...patch };
+        const threadChanged = next.threadId !== this.agentState.threadId;
+        const turnChanged = Boolean(this.agentState.turnId && next.turnId && next.turnId !== this.agentState.turnId);
+        const nextTurnStarted = !this.agentState.busy && next.busy;
         if (!options.preserveReplay && (threadChanged || turnChanged || nextTurnStarted)) {
-            this.codexReplayEvents.clear();
-            this.codexReplayActiveItems.clear();
+            this.replayEvents.clear();
+            this.replayActiveItems.clear();
         }
         if (!next.busy) {
             if (this.boundClientId && !this.clients.has(this.boundClientId)) this.boundClientId = "";
         }
-        if (next.busy === this.codexState.busy && next.threadId === this.codexState.threadId && next.turnId === this.codexState.turnId) return;
-        this.codexState = next;
-        logger.debug("Codex state changed", this.codexState);
-        this.emitAll("codex_state", this.codexState);
+        if (next.busy === this.agentState.busy && next.threadId === this.agentState.threadId && next.turnId === this.agentState.turnId) return;
+        this.agentState = next;
+        logger.debug("Agent state changed", { ...this.agentState, ...this.scope });
+        this.emitAll(this.activeEngineId === "codex" ? "codex_state" : "agent_state", { ...this.agentState, globalBusy: this.globalBusy });
     }
 
     /** 权威历史已覆盖指定 turn 后，清理其断线重放事件。 */
-    acknowledgeCodexHistory(threadId: string, turnIds: string[]) {
+    acknowledgeHistory(threadId: string, turnIds: string[]) {
         const acknowledged = new Set(turnIds.filter(Boolean));
         if (!threadId || !acknowledged.size) return;
-        this.codexReplayEvents.forEach((event, key) => {
+        this.replayEvents.forEach((event, key) => {
             const eventThreadId = String(event.payload.threadId || event.payload.thread_id || "");
             const eventTurnId = String(event.payload.turnId || event.payload.turn_id || "");
             if (eventThreadId === threadId && acknowledged.has(eventTurnId)) {
-                this.codexReplayEvents.delete(key);
-                this.codexReplayActiveItems.delete(key);
+                this.replayEvents.delete(key);
+                this.replayActiveItems.delete(key);
             }
         });
     }
@@ -279,8 +334,8 @@ export class CanvasSession {
                 this.clientFocusOrder.set(clientId, ++this.focusSequence);
             }
         }
-        sendEvent(res, "hello", { ok: true, protocolVersion: AGENT_PROTOCOL_VERSION, clientId, workspace: { activeThreadId }, conversation: this.conversationStateSnapshot, codex: this.codexState, pendingApprovals: this.codexPendingApprovals });
-        if (!statusOnly && activeThreadId && this.codexState.threadId === activeThreadId) this.codexReplayEvents.forEach((event) => sendEvent(res, event.type, event.payload));
+        sendEvent(res, "hello", { ok: true, protocolVersion: AGENT_PROTOCOL_VERSION, ...this.engineSnapshot, clientId, workspace: { activeThreadId }, conversation: this.conversationStateSnapshot, codex: this.agentState, pendingApprovals: this.pendingApprovalSnapshot });
+        if (!statusOnly && activeThreadId && this.agentState.threadId === activeThreadId) this.replayEvents.forEach((event) => sendEvent(res, event.type, event.payload));
         const timer = setInterval(() => sendEvent(res, "ping", { time: Date.now() }), 15000);
         res.on("close", () => {
             clearInterval(timer);
@@ -299,9 +354,11 @@ export class CanvasSession {
     }
 
     private updateConversation(patch: Partial<Omit<ConversationState, "revision">>) {
+        const wasBusy = this.globalBusy;
         this.conversationState = { ...this.conversationState, ...patch, revision: this.conversationState.revision + 1 };
         const snapshot = this.conversationStateSnapshot;
         this.emitAll("conversation_changed", snapshot);
+        if (wasBusy !== this.globalBusy) this.emitAll("agent_state", { ...this.agentState, globalBusy: this.globalBusy });
         return snapshot;
     }
 
@@ -374,8 +431,9 @@ export class CanvasSession {
     /** 接收网页返回的工具调用结果。 */
     resolveResult(clientId: string, body: { requestId?: string; error?: string; result?: unknown }) {
         const item = body.requestId ? this.pending.get(body.requestId) : null;
-        if (!item || !body.requestId || item.clientId !== clientId) return false;
+        if (!item || !body.requestId || item.clientId !== clientId || !this.matchesScope(item) || item.threadId !== this.agentState.threadId || item.turnId !== this.agentState.turnId) return false;
         this.pending.delete(body.requestId);
+        this.emitAll("agent_state", { ...this.agentState, globalBusy: this.globalBusy });
         logger.debug("Canvas tool result received", { clientId, requestId: body.requestId, error: body.error, result: body.result });
         body.error ? item.reject(new Error(body.error)) : item.resolve(body.result);
         return true;
@@ -383,27 +441,29 @@ export class CanvasSession {
 
     /** 向全部已连接网页广播事件。 */
     emitAll(type: string, payload: unknown) {
-        this.clients.forEach((client) => sendEvent(client, type, payload));
+        if (!this.matchesScope(recordValue(payload))) return;
+        this.clients.forEach((client) => sendEvent(client, type, this.envelope(payload)));
     }
 
     /** 向全部网页广播带线程归属的事件。 */
     emitThread(type: string, threadId: string, payload: Record<string, unknown> = {}) {
-        const data: Record<string, unknown> = { ...payload, threadId };
-        const replayKey = codexReplayKey(type, data);
+        if (!this.matchesScope(payload)) return;
+        const data: Record<string, unknown> = this.envelope({ ...payload, threadId });
+        const replayKey = agentReplayKey(type, data);
         const eventTurnId = String(data.turnId || data.turn_id || "");
-        const currentScope = threadId === this.codexState.threadId && (!this.codexState.turnId || !eventTurnId || eventTurnId === this.codexState.turnId);
-        if (this.codexState.busy && currentScope && replayKey) {
+        const currentScope = threadId === this.agentState.threadId && (!this.agentState.turnId || !eventTurnId || eventTurnId === this.agentState.turnId);
+        if (this.agentState.busy && currentScope && replayKey) {
             const item = recordValue(data.item);
             const eventType = String(data.type || "");
-            if (type === "agent_event" && item.id && (eventType === "item.started" || eventType === "item.updated")) this.codexReplayActiveItems.add(replayKey);
-            if (type === "agent_event" && item.id && eventType === "item.completed") this.codexReplayActiveItems.delete(replayKey);
+            if (type === "agent_event" && item.id && (eventType === "item.started" || eventType === "item.updated")) this.replayActiveItems.add(replayKey);
+            if (type === "agent_event" && item.id && eventType === "item.completed") this.replayActiveItems.delete(replayKey);
             if (type === "agent_event" && (eventType === "turn.completed" || eventType === "error")) this.clearReplayActiveTurn(threadId, eventTurnId);
             const replayData = this.replaySnapshot(replayKey, data);
-            this.codexReplayEvents.set(replayKey, { type, payload: { ...replayData, replayed: true } });
-            while (this.codexReplayEvents.size > 240) {
-                const evictable = [...this.codexReplayEvents.keys()].find((key) => !this.codexReplayActiveItems.has(key));
+            this.replayEvents.set(replayKey, { type, payload: { ...replayData, replayed: true } });
+            while (this.replayEvents.size > 240) {
+                const evictable = [...this.replayEvents.keys()].find((key) => !this.replayActiveItems.has(key));
                 if (!evictable) break;
-                this.codexReplayEvents.delete(evictable);
+                this.replayEvents.delete(evictable);
             }
         }
         this.emitAll(type, data);
@@ -414,7 +474,7 @@ export class CanvasSession {
         if (data.type !== "item.updated" && data.type !== "item.completed") return data;
         const item = recordValue(data.item);
         if (!item.id) return data;
-        const previous = recordValue(recordValue(this.codexReplayEvents.get(replayKey)?.payload).item);
+        const previous = recordValue(recordValue(this.replayEvents.get(replayKey)?.payload).item);
         const delta = String(item.delta || "");
         if (!delta) return data;
         const previousText = String(previous.text || "");
@@ -424,26 +484,28 @@ export class CanvasSession {
 
     private clearReplayActiveTurn(threadId: string, turnId: string) {
         const prefix = `item:${turnId}:`;
-        this.codexReplayActiveItems.forEach((key) => {
-            if (key.startsWith(prefix)) this.codexReplayActiveItems.delete(key);
+        this.replayActiveItems.forEach((key) => {
+            if (key.startsWith(prefix)) this.replayActiveItems.delete(key);
         });
         if (!turnId) return;
-        this.codexReplayActiveItems.forEach((key) => {
-            const event = this.codexReplayEvents.get(key);
+        this.replayActiveItems.forEach((key) => {
+            const event = this.replayEvents.get(key);
             const eventThreadId = String(event?.payload.threadId || event?.payload.thread_id || "");
             const eventTurnId = String(event?.payload.turnId || event?.payload.turn_id || "");
-            if (eventThreadId === threadId && eventTurnId === turnId) this.codexReplayActiveItems.delete(key);
+            if (eventThreadId === threadId && eventTurnId === turnId) this.replayActiveItems.delete(key);
         });
     }
 
     /** 校验工具参数并将调用分派到当前目标网页。 */
-    async callTool(name: unknown, rawInput: unknown) {
+    async callTool(name: unknown, rawInput: unknown, options: { scope?: Partial<AgentScope>; signal?: AbortSignal } = {}) {
+        if (options.scope && !this.matchesScope(options.scope)) throw new Error("工具调用来自已失效的 Agent 运行实例");
+        options.signal?.throwIfAborted();
         if (!isToolName(name)) throw new Error(`未知工具：${String(name)}`);
         logger.info("MCP tool called", { name, input: rawInput, targetClientId: this.targetClientId });
         const input = parseToolInput(name, rawInput) as Record<string, unknown>;
         if (SITE_TOOLS.has(name)) {
             if (!this.clients.size) throw new Error("当前没有已连接网页");
-            return await this.requestCanvasTool(name, input);
+            return await this.requestCanvasTool(name, input, options.signal);
         }
         const readTool = ["canvas_get_state", "canvas_get_selection", "canvas_export_snapshot"].includes(name);
         if (readTool && (!this.clients.size || !this.canvasState)) throw new Error("当前没有已连接画布");
@@ -452,14 +514,14 @@ export class CanvasSession {
             const ids = new Set(this.canvasState?.selectedNodeIds || []);
             return { nodes: (this.canvasState?.nodes || []).filter((node) => ids.has(node.id)).map(compactNode) };
         }
-        if (name === "canvas_create_attachment_nodes") return await this.createAttachmentNodes(input as { attachmentIds: string[]; x?: number; y?: number; gap?: number; direction?: "row" | "column" });
+        if (name === "canvas_create_attachment_nodes") return await this.createAttachmentNodes(input as { attachmentIds: string[]; x?: number; y?: number; gap?: number; direction?: "row" | "column" }, options.signal);
         if (!this.clients.size) throw new Error("当前没有已连接画布");
         const request = buildCanvasToolRequest(name, input, this.canvasState);
-        return await this.requestCanvasTool(request.name, request.input);
+        return await this.requestCanvasTool(request.name, request.input, options.signal);
     }
 
     /** 将当前 turn 的附件转换为画布图片节点。 */
-    private async createAttachmentNodes(input: { attachmentIds: string[]; x?: number; y?: number; gap?: number; direction?: "row" | "column" }) {
+    private async createAttachmentNodes(input: { attachmentIds: string[]; x?: number; y?: number; gap?: number; direction?: "row" | "column" }, signal?: AbortSignal) {
         const clientId = this.targetClientId;
         if (!this.clients.has(clientId)) throw new Error("当前没有已连接画布");
         const attachments = input.attachmentIds.map((id) => this.getTurnAttachment(clientId, id));
@@ -481,31 +543,58 @@ export class CanvasSession {
             offset += (direction === "row" ? size.width : size.height) + gap;
             return node;
         });
-        await this.requestCanvasTool("canvas_create_attachment_nodes", { nodes });
+        await this.requestCanvasTool("canvas_create_attachment_nodes", { nodes }, signal);
         return { nodes: nodes.map(({ id, attachmentId, title }) => ({ id, attachmentId, title })) };
     }
 
     /** 向目标网页发送工具请求并等待调用结果。 */
-    private async requestCanvasTool(name: ToolName, input: Record<string, unknown>) {
+    private async requestCanvasTool(name: ToolName, input: Record<string, unknown>, signal?: AbortSignal) {
+        signal?.throwIfAborted();
         const requestId = crypto.randomUUID();
         const clientId = this.targetClientId;
         const client = this.clients.get(clientId);
         if (!client) throw new Error("当前没有已连接画布");
-        sendEvent(client, "tool_call", { requestId, name, input });
         logger.debug("Canvas tool request sent", { requestId, name, input, clientId });
         return await new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                this.pending.delete(requestId);
                 logger.warn("Canvas tool request timed out", { requestId, name, clientId });
-                reject(new Error("画布操作超时"));
+                this.rejectToolRequest(requestId, new Error("画布操作超时"));
             }, 30000);
-            this.pending.set(requestId, { clientId, resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
+            const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); };
+            const abort = () => {
+                this.rejectToolRequest(requestId, signal?.reason instanceof Error ? signal.reason : new Error("工具调用已取消"));
+            };
+            this.pending.set(requestId, {
+                clientId, ...this.scope, threadId: this.agentState.threadId, turnId: this.agentState.turnId,
+                resolve: (value) => { cleanup(); resolve(value); },
+                reject: (error) => { cleanup(); reject(error); },
+            });
+            this.emitAll("agent_state", { ...this.agentState, globalBusy: this.globalBusy });
+            signal?.addEventListener("abort", abort, { once: true });
+            sendEvent(client, "tool_call", this.envelope({ requestId, name, input, threadId: this.agentState.threadId, turnId: this.agentState.turnId }));
         });
+    }
+
+    cancelPendingTools(reason = "当前 Agent 任务已结束") {
+        this.pending.forEach((_pending, id) => this.rejectToolRequest(id, new Error(reason)));
+    }
+
+    private rejectToolRequest(requestId: string, error: Error) {
+        const pending = this.pending.get(requestId);
+        if (!pending) return;
+        this.pending.delete(requestId);
+        this.emitAll("agent_state", { ...this.agentState, globalBusy: this.globalBusy });
+        const client = this.clients.get(pending.clientId);
+        if (client) sendEvent(client, "tool_cancelled", {
+            requestId, reason: error.message, engineId: pending.engineId, runtimeId: pending.runtimeId,
+            threadId: pending.threadId, turnId: pending.turnId,
+        });
+        pending.reject(error);
     }
 }
 
 /** 为运行中 turn 的可重放事件生成稳定键。 */
-function codexReplayKey(type: string, payload: Record<string, unknown>) {
+function agentReplayKey(type: string, payload: Record<string, unknown>) {
     const turnId = String(payload.turnId || payload.turn_id || "");
     if (type === "chat_message") {
         const message = recordValue(payload.message);
@@ -515,7 +604,7 @@ function codexReplayKey(type: string, payload: Record<string, unknown>) {
         return messageId ? `chat:${turnId}:${messageId}` : "";
     }
     if (type === "agent_error") return `error:${turnId}`;
-    if (type !== "agent_event") return "";
+    if (type !== "agent_event" && type !== "dsh_event") return "";
     const item = recordValue(payload.item);
     if (item.id) return `item:${turnId}:${String(item.id)}`;
     const eventType = String(payload.type || "");

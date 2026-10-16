@@ -5,10 +5,11 @@ import { Check, ChevronDown, CircleAlert, FilePenLine, LoaderCircle, LockKeyhole
 import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
-import { createCodexSkill, createCodexSkillDraft, deleteCodexSkill, fetchCodexSkill, postState, setCodexSkillEnabled, updateCodexSkill, type AgentSkillDetail, type AgentSkillDraft, type AgentSkillInterface, type AgentSkillScope, type AgentSkillSummary } from "@/services/api/canvas-agent";
+import { createAgentSkill, createAgentSkillDraft, deleteAgentSkill, fetchAgentSkill, postState, setAgentSkillEnabled, updateAgentSkill, type AgentSkillDetail, type AgentSkillDraft, type AgentSkillInterface, type AgentSkillScope, type AgentSkillSummary } from "@/services/api/canvas-agent";
 import { useAgentSkillStore } from "@/stores/use-agent-skill-store";
 import { useAgentStore, type AgentChatItem } from "@/stores/use-agent-store";
 import { useThemeStore } from "@/stores/use-theme-store";
+import { agentSkillMarker, agentIsBusy } from "@/lib/agent/agent-engine";
 
 type ScopeFilter = "all" | AgentSkillScope;
 type SkillDraftSource = "conversation" | "canvas";
@@ -22,13 +23,14 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { message, modal } = App.useApp();
     const connected = useAgentStore((state) => state.connected);
+    const engineId = useAgentStore((state) => state.engineId);
+    const runtimeId = useAgentStore((state) => state.runtimeId);
     const url = useAgentStore((state) => state.url);
     const token = useAgentStore((state) => state.token);
     const activeThreadId = useAgentStore((state) => state.activeThreadId);
     const hasConversation = useAgentStore((state) => hasSettledConversation(state.messages, state.activeThreadId));
     const hasCanvas = useAgentStore((state) => Boolean(state.canvasContext));
-    const sending = useAgentStore((state) => state.sending);
-    const waiting = useAgentStore((state) => state.waiting);
+    const engineBusy = useAgentStore((state) => agentIsBusy(state));
     const setAgentState = useAgentStore((state) => state.setAgentState);
     const skills = useAgentSkillStore((state) => state.skills);
     const selectedSkill = useAgentSkillStore((state) => state.selectedSkill);
@@ -67,7 +69,7 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
     const connectionIsCurrent = (revision: number) => {
         const agent = useAgentStore.getState();
         const skillsState = useAgentSkillStore.getState();
-        return skillsState.connectionRevision === revision && agent.connected && agent.url.trim().replace(/\/$/, "") === endpoint && agent.token === token;
+        return skillsState.connectionRevision === revision && agent.engineId === engineId && agent.runtimeId === runtimeId && agent.connected && agent.url.trim().replace(/\/$/, "") === endpoint && agent.token === token;
     };
     useEffect(() => {
         if (draft) setEditor((current) => current || { mode: "create", values: draftFormValues(draft) });
@@ -83,14 +85,14 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
         setBusySkill("");
         setErrorsOpen(false);
         form.resetFields();
-    }, [connected, form]);
+    }, [connected, engineId, runtimeId, form]);
     const useSkill = (skill: AgentSkillSummary) => {
         selectSkill(skill);
         setAgentState({ activeTab: "chat" });
     };
     const generateDraft = async (source: SkillDraftSource) => {
         const agent = useAgentStore.getState();
-        if (agent.sending || agent.waiting) return message.warning(t("agent.skillManager.codexBusy"));
+        if (agentIsBusy(agent)) return message.warning(t("agentEngines.busy"));
         if (source === "conversation" && !hasSettledConversation(agent.messages, agent.activeThreadId)) return message.warning(t("agent.skillManager.noConversation"));
         if (source === "canvas" && !agent.canvasContext) return message.warning(t("agent.skillManager.noCanvas"));
         if (!clientId) return message.warning(t("agent.skillManager.connecting"));
@@ -102,11 +104,12 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
                 if (!synced) throw new Error(t("agent.skillManager.syncFailed"));
             }
             if (!connectionIsCurrent(connectionRevision)) return;
-            const response = await createCodexSkillDraft(endpoint, token, {
+            const response = await createAgentSkillDraft(endpoint, token, {
                 source,
                 threadId: agent.activeThreadId,
                 clientId,
-                ...(agent.model ? { model: agent.model } : {}),
+                ...(agent.model ? { model: agent.models.find((item) => (item.id || item.model) === agent.model)?.model || agent.model } : {}),
+                provider: agent.models.find((item) => (item.id || item.model) === agent.model)?.provider,
                 ...(agent.reasoningEffort ? { effort: agent.reasoningEffort } : {}),
             });
             if (!connectionIsCurrent(connectionRevision)) return;
@@ -124,7 +127,7 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
         const connectionRevision = useAgentSkillStore.getState().connectionRevision;
         setBusySkill(skill.path);
         try {
-            const response = await fetchCodexSkill(endpoint, token, skill.name);
+            const response = await fetchAgentSkill(endpoint, token, skill.name);
             if (!connectionIsCurrent(connectionRevision)) return;
             if (!response.data) throw new Error(t("agent.skillManager.contentMissing"));
             setEditor({ mode: "edit", detail: response.data });
@@ -147,8 +150,8 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
         }
         const name = editor.mode === "edit" ? editor.detail.name : values.name.trim();
         const skillInterface = compactInterface(values);
-        if (skillInterface?.defaultPrompt && !mentionsSkill(skillInterface.defaultPrompt, name)) {
-            form.setFields([{ name: "defaultPrompt", errors: [t("agent.skillManager.defaultPromptMention", { name })] }]);
+        if (skillInterface?.defaultPrompt && !mentionsSkill(skillInterface.defaultPrompt, agentSkillMarker(engineId, name))) {
+            form.setFields([{ name: "defaultPrompt", errors: [t("agentEngines.defaultPromptMention", { marker: agentSkillMarker(engineId, name) })] }]);
             setAdvancedOpen(true);
             requestAnimationFrame(() => form.scrollToField("defaultPrompt", { block: "center" }));
             return;
@@ -158,8 +161,8 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
         setSaving(true);
         try {
             const input = { description: values.description.trim(), instructions: values.instructions.trim(), interface: skillInterface || null };
-            if (editor.mode === "create") await createCodexSkill(endpoint, token, { name, ...input });
-            else await updateCodexSkill(endpoint, token, name, { ...input, expectedRevision: editor.detail.revision });
+            if (editor.mode === "create") await createAgentSkill(endpoint, token, { name, ...input });
+            else await updateAgentSkill(endpoint, token, name, { ...input, expectedRevision: editor.detail.revision });
             if (!connectionIsCurrent(connectionRevision)) return;
             setDraft(null);
             setEditor(null);
@@ -185,10 +188,10 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
                 if (!connectionIsCurrent(connectionRevision)) return;
                 setBusySkill(skill.path);
                 try {
-                    const response = await fetchCodexSkill(endpoint, token, skill.name);
+                    const response = await fetchAgentSkill(endpoint, token, skill.name);
                     if (!connectionIsCurrent(connectionRevision)) return;
                     if (!response.data) throw new Error(t("agent.skillManager.contentMissing"));
-                    await deleteCodexSkill(endpoint, token, skill.name, response.data.revision);
+                    await deleteAgentSkill(endpoint, token, skill.name, response.data.revision);
                     if (!connectionIsCurrent(connectionRevision)) return;
                     if (selectedSkill?.name === skill.name && selectedSkill.path === skill.path) clearSelection();
                     await refresh();
@@ -212,7 +215,7 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
         if (!connectionIsCurrent(connectionRevision)) return;
         setBusySkill(skill.path);
         try {
-            await setCodexSkillEnabled(endpoint, token, skill, enabled);
+            await setAgentSkillEnabled(endpoint, token, skill, enabled);
             if (!connectionIsCurrent(connectionRevision)) return;
             if (!enabled && selectedSkill?.name === skill.name && selectedSkill.path === skill.path) clearSelection();
             await refresh();
@@ -222,7 +225,7 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
             if (connectionIsCurrent(connectionRevision)) setBusySkill("");
         }
     };
-    const codexBusy = sending || waiting;
+    const codexBusy = engineBusy;
     const createMenu: MenuProps = {
         items: [
             {
@@ -329,7 +332,7 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
                                     </div>
                                     <div className="mt-2 flex items-center justify-between gap-2 pl-7">
                                         <label className="inline-flex items-center gap-2 text-xs" style={{ color: theme.node.muted }}>
-                                            <Switch size="small" checked={skill.enabled} loading={busy} disabled={!connected || Boolean(busySkill) || Boolean(generatingSource)} onChange={(enabled) => void toggleEnabled(skill, enabled)} />
+                                            <Switch size="small" checked={skill.enabled} loading={busy} disabled={!connected || (engineId === "dsh" && !skill.managed) || Boolean(busySkill) || Boolean(generatingSource)} onChange={(enabled) => void toggleEnabled(skill, enabled)} />
                                             {t(skill.enabled ? "agent.skillManager.enabled" : "agent.skillManager.disabled")}
                                         </label>
                                         <div className="flex items-center gap-0.5">
@@ -383,12 +386,12 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
                 <Form key={editor?.mode === "edit" ? editor.detail.revision : `create:${editor?.values?.name || "blank"}`} form={form} initialValues={editorValues} layout="vertical" requiredMark="optional" preserve={false}>
                     <div className="mb-3 text-xs font-medium" style={{ color: theme.node.muted }}>{t("agent.skillManager.basicInfo")}</div>
                     <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
-                        <Form.Item name="name" label={t("agent.skillManager.identifier")} extra={t("agent.skillManager.identifierExtra")} rules={[{ required: true, message: t("agent.skillManager.identifierRequired") }, { max: 64, message: t("agent.skillManager.identifierMax") }, { pattern: skillNamePattern, message: t("agent.skillManager.identifierPattern") }]}>
+                        <Form.Item name="name" label={t("agent.skillManager.identifier")} extra={t("agentEngines.identifierExtra", { marker: agentSkillMarker(engineId, "skill-name") })} rules={[{ required: true, message: t("agent.skillManager.identifierRequired") }, { max: 64, message: t("agent.skillManager.identifierMax") }, { pattern: skillNamePattern, message: t("agent.skillManager.identifierPattern") }]}>
                             <Input maxLength={64} disabled={editor?.mode === "edit"} placeholder={t("agent.skillManager.identifierPlaceholder")} />
                         </Form.Item>
                         <Form.Item name="displayName" label={t("agent.skillManager.displayName")} rules={[{ max: 64, message: t("agent.skillManager.displayNameMax") }]}><Input maxLength={64} placeholder={t("agent.skillManager.displayNamePlaceholder")} /></Form.Item>
                     </div>
-                    <Form.Item name="description" label={t("agent.skillManager.whenToUse")} extra={t("agent.skillManager.whenToUseExtra")} rules={[{ required: true, message: t("agent.skillManager.whenToUseRequired") }, { max: 1024, message: t("agent.skillManager.whenToUseMax") }, { validator: (_, value) => typeof value === "string" && /[<>]/.test(value) ? Promise.reject(new Error(t("agent.skillManager.noAngleBrackets"))) : Promise.resolve() }]}><Input.TextArea maxLength={1024} autoSize={{ minRows: 2, maxRows: 4 }} placeholder={t("agent.skillManager.whenToUsePlaceholder")} /></Form.Item>
+                    <Form.Item name="description" label={t("agent.skillManager.whenToUse")} extra={t("agentEngines.whenToUseExtra")} rules={[{ required: true, message: t("agent.skillManager.whenToUseRequired") }, { max: 1024, message: t("agent.skillManager.whenToUseMax") }, { validator: (_, value) => typeof value === "string" && /[<>]/.test(value) ? Promise.reject(new Error(t("agent.skillManager.noAngleBrackets"))) : Promise.resolve() }]}><Input.TextArea maxLength={1024} autoSize={{ minRows: 2, maxRows: 4 }} placeholder={t("agent.skillManager.whenToUsePlaceholder")} /></Form.Item>
                     <Form.Item name="instructions" label={t("agent.skillManager.instructions")} extra={t("agent.skillManager.instructionsExtra")} rules={[{ required: true, message: t("agent.skillManager.instructionsRequired") }]}><Input.TextArea className="!leading-6" autoSize={{ minRows: 6, maxRows: 10 }} placeholder={t("agent.skillManager.instructionsPlaceholder")} /></Form.Item>
                     <Collapse
                         ghost
@@ -403,7 +406,7 @@ export function AgentSkillsView({ clientId }: { clientId: string }) {
                             children: (
                                 <>
                                     <Form.Item name="shortDescription" label={t("agent.skillManager.shortDescription")} extra={t("agent.skillManager.shortDescriptionExtra")} rules={[{ min: 25, message: t("agent.skillManager.shortDescriptionMin") }, { max: 64, message: t("agent.skillManager.shortDescriptionMax") }]}><Input maxLength={64} showCount placeholder={t("agent.skillManager.shortDescriptionPlaceholder")} /></Form.Item>
-                                    <Form.Item name="defaultPrompt" label={t("agent.skillManager.defaultPrompt")} extra={t("agent.skillManager.defaultPromptExtra")} rules={[{ max: 1024, message: t("agent.skillManager.defaultPromptMax") }]}><Input.TextArea maxLength={1024} autoSize={{ minRows: 2, maxRows: 4 }} placeholder={t("agent.skillManager.defaultPromptPlaceholder")} /></Form.Item>
+                                    <Form.Item name="defaultPrompt" label={t("agent.skillManager.defaultPrompt")} extra={t("agentEngines.defaultPromptExtra", { marker: agentSkillMarker(engineId, "skill-name") })} rules={[{ max: 1024, message: t("agent.skillManager.defaultPromptMax") }]}><Input.TextArea maxLength={1024} autoSize={{ minRows: 2, maxRows: 4 }} placeholder={t("agent.skillManager.defaultPromptPlaceholder")} /></Form.Item>
                                 </>
                             ),
                         }]}
@@ -449,6 +452,7 @@ function compactInterface(values: SkillFormValues): AgentSkillInterface | undefi
     return Object.values(skillInterface).some(Boolean) ? skillInterface : undefined;
 }
 
-function mentionsSkill(prompt: string, name: string) {
-    return new RegExp(`\\$${name}(?![A-Za-z0-9_-]|:[A-Za-z0-9_-])`).test(prompt);
+function mentionsSkill(prompt: string, marker: string) {
+    const name = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`${name}(?![A-Za-z0-9_-]|:[A-Za-z0-9_-])`).test(prompt);
 }

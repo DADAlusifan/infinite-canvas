@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
 import { localForageStorage } from "@/lib/localforage-storage";
+import { isDesktop } from "@/services/desktop/runtime";
 
 export type InstalledPlugin = {
     id: string;
@@ -40,6 +41,13 @@ export const usePluginStore = create<PluginStore>()(
         {
             name: "infinite-canvas:plugin_store",
             storage: createJSONStorage(() => localForageStorage),
+            skipHydration: isDesktop(),
+            merge: (persisted, current) => {
+                if (persisted === undefined) return current;
+                const value = persisted as Partial<PluginStore>;
+                if (!Array.isArray(value.plugins) || value.plugins.some((plugin) => !plugin || typeof plugin.id !== "string" || typeof plugin.source !== "string")) throw new Error("插件记录损坏，已保留原数据");
+                return { ...current, plugins: value.plugins };
+            },
         },
     ),
 );

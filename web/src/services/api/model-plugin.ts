@@ -1,4 +1,5 @@
 import axios, { type AxiosRequestConfig } from "axios";
+import { desktopFetch, isDesktop } from "@/services/desktop/runtime";
 
 import i18n from "@/i18n";
 import { buildApiUrl, withLocalProxy, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
@@ -133,6 +134,7 @@ export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<
         "sleep",
         "signal",
         "onDelta",
+        "fetch",
         `"use strict"; return (async () => {\n${args.script}\n})();`,
     ) as (...fnArgs: unknown[]) => Promise<T>;
     try {
@@ -154,6 +156,7 @@ export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<
             (ms: number) => sleep(ms, args.signal),
             args.signal,
             args.onDelta,
+            isDesktop() ? desktopFetch : globalThis.fetch.bind(globalThis),
         );
     } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") throw error;

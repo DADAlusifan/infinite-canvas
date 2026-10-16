@@ -1,5 +1,6 @@
 import i18n from "@/i18n";
 import { getMediaBlob } from "@/services/file-storage";
+import { desktopBlobUrl, isDesktop } from "@/services/desktop/runtime";
 import { withLocalProxy } from "@/stores/use-config-store";
 
 export type VideoFramePosition = "first" | "last" | "current";
@@ -25,10 +26,11 @@ export async function captureVideoFrame(source: string, position: VideoFramePosi
     video.preload = "auto";
     let objectUrl: string | undefined;
     try {
-        const blob = options.storageKey ? await getMediaBlob(options.storageKey) : null;
+        const nativeUrl = isDesktop() && options.storageKey ? desktopBlobUrl("media_files", options.storageKey) : undefined;
+        const blob = options.storageKey && !nativeUrl ? await getMediaBlob(options.storageKey) : null;
         if (blob) objectUrl = URL.createObjectURL(blob);
         await waitForVideo(video, "loadeddata", () => {
-            video.src = objectUrl || withLocalProxy(source);
+            video.src = nativeUrl || objectUrl || withLocalProxy(source);
             video.load();
         });
 

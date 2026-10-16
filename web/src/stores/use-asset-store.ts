@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
 import { cleanupUnusedImages, ensureImagePreview, previewUrlFor, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
+import { isDesktop } from "@/services/desktop/runtime";
 
 export type AssetKind = "text" | "image" | "video";
 export type TextAsset = AssetBase<"text"> & { data: { content: string } };
@@ -43,32 +44,39 @@ export function assetCoverUrl(asset: Asset) {
 }
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";
+let persistedAssets: Asset[] | null = null;
 
 const assetStorage: PersistStorage<AssetStore> = {
     getItem: async (name) => {
         const value = await localForageStorage.getItem(name);
-        if (!value) return null;
+        if (value === null) { persistedAssets = useAssetStore.getState().assets; return null; }
         const parsed = JSON.parse(value) as StorageValue<AssetStore>;
+        if (!parsed?.state || !Array.isArray(parsed.state.assets)) throw new Error("素材存储结构损坏，已保留原数据");
         parsed.state.assets = await Promise.all(
             parsed.state.assets.map(async (asset) => {
                 if (asset.kind === "video" && asset.data.storageKey) return { ...asset, data: { ...asset.data, url: await resolveMediaUrl(asset.data.storageKey, asset.data.url) } };
                 if (asset.kind !== "image") return asset;
                 if (asset.data.storageKey) {
-                    void ensureImagePreview(asset.data.storageKey);
+                    if (!isDesktop()) void ensureImagePreview(asset.data.storageKey);
                     return {
                         ...asset,
                         coverUrl: asset.coverUrl.startsWith("blob:") ? await resolveImageUrl(asset.data.storageKey, asset.coverUrl) : asset.coverUrl,
                         data: { ...asset.data, dataUrl: await resolveImageUrl(asset.data.storageKey, asset.data.dataUrl) },
                     };
                 }
-                if (!asset.data.dataUrl.startsWith("data:image/")) return asset;
+                if (isDesktop() || !asset.data.dataUrl.startsWith("data:image/")) return asset;
                 const image = await uploadImage(asset.data.dataUrl);
                 return { ...asset, coverUrl: asset.coverUrl.startsWith("data:image/") ? image.url : asset.coverUrl, data: { ...asset.data, dataUrl: image.url, storageKey: image.storageKey, bytes: image.bytes, mimeType: image.mimeType } };
             }),
         );
+        persistedAssets = parsed.state.assets;
         return parsed;
     },
-    setItem: (name, value) => localForageStorage.setItem(name, JSON.stringify(value)),
+    setItem: (name, value) => {
+        if (persistedAssets === value.state.assets) return;
+        persistedAssets = value.state.assets;
+        return localForageStorage.setItem(name, JSON.stringify(value));
+    },
     removeItem: (name) => localForageStorage.removeItem(name),
 };
 
@@ -105,9 +113,10 @@ export const useAssetStore = create<AssetStore>()(
         {
             name: ASSET_STORE_KEY,
             storage: assetStorage,
+            skipHydration: isDesktop(),
             partialize: (state) => ({ assets: state.assets }) as StorageValue<AssetStore>["state"],
-            onRehydrateStorage: () => () => {
-                useAssetStore.setState({ hydrated: true });
+            onRehydrateStorage: () => (_state, error) => {
+                if (!error) useAssetStore.setState({ hydrated: true });
             },
         },
     ),

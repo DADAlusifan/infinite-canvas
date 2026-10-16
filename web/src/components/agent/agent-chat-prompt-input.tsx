@@ -33,6 +33,7 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
     const skillsLoading = useAgentSkillStore((state) => state.loading);
     const selectedSkill = useAgentSkillStore((state) => state.selectedSkill);
     const canvasReferences = useAgentStore((state) => state.canvasReferences);
+    const engineId = useAgentStore((state) => state.engineId);
     const [command, setCommand] = useState<ComposerCommand | null>(null);
     const [activeIndex, setActiveIndex] = useState(0);
     const [resourceCandidates, setResourceCandidates] = useState<CanvasResourceReference[]>([]);
@@ -42,7 +43,8 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
         name: selectedSkill.name,
         path: selectedSkill.path,
         displayName: selectedSkill.interface?.displayName || undefined,
-    } : undefined, [selectedSkill]);
+        engineId,
+    } : undefined, [engineId, selectedSkill]);
     const tokens = useMemo(() => parseAgentInlineTokens(value, canvasReferences, messageSkill), [canvasReferences, messageSkill, value]);
     const selectedReferenceIds = useMemo(() => new Set(canvasReferences.map((item) => item.nodeId)), [canvasReferences]);
     const candidates = useMemo<ComposerCandidate[]>(() => {
@@ -123,7 +125,7 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
                 closeCommand();
                 return;
             }
-            insertTokenAtCaret(editor, createSkillToken({ name: candidate.skill.name, path: candidate.skill.path, displayName: candidate.skill.interface?.displayName || undefined }, theme));
+            insertTokenAtCaret(editor, createSkillToken({ name: candidate.skill.name, path: candidate.skill.path, displayName: candidate.skill.interface?.displayName || undefined, engineId }, theme));
             const next = serializeEditor(editor);
             emit(next);
             useAgentSkillStore.getState().selectSkill(candidate.skill);

@@ -1,8 +1,11 @@
+import { registerStorageFlusher } from "@/services/storage/maintenance";
+import { startCanvasGenerationRequest, finishCanvasGenerationRequest, stopCanvasGenerationRequests, type CanvasGenerationRequest } from "@/lib/canvas/generation-requests";
+import { registerMediaReferences } from "@/services/storage/references";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Group, Video } from "lucide-react";
-import { saveAs } from "file-saver";
+import { useDownloadFile } from "@/hooks/use-download-file";
 import { useTranslation } from "react-i18next";
 
 import { requestEdit, requestGeneration, requestImageQuestion, resolveImageRequestSize } from "@/services/api/image";
@@ -114,12 +117,7 @@ type CanvasHistoryEntry = Pick<CanvasClipboard, "nodes" | "connections"> & {
     showImageInfo: boolean;
 };
 
-type CanvasGenerationRequest = {
-    targetNodeId: string;
-    originNodeId: string;
-    runningNodeId: string;
-    controller: AbortController;
-};
+
 
 const VIDEO_NODE_MAX_WIDTH = 420;
 const VIDEO_NODE_MAX_HEIGHT = 420;
@@ -167,6 +165,7 @@ function measureFocusFrame(container: HTMLDivElement | null, nodeId: string) {
 }
 
 function InfiniteCanvasPage() {
+    const downloadFile = useDownloadFile();
     const { message, modal } = App.useApp();
     const { t } = useTranslation();
     // Subscribe to the registry version so plugin registration changes rerender the canvas.
@@ -297,6 +296,21 @@ function InfiniteCanvasPage() {
         [activeChatId, backgroundMode, chatSessions, showImageInfo],
     );
 
+    useEffect(() => registerMediaReferences(() => ({ current: createHistoryEntry(), history: historyRef.current, last: lastHistoryRef.current })), [createHistoryEntry]);
+    useEffect(() => registerStorageFlusher(() => {
+        if (!projectLoaded) return;
+        if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+        const saved = useCanvasStore.getState().openProject(projectId);
+        const entry = createHistoryEntry();
+        const viewport = viewportRef.current;
+        const changed = !saved || Object.entries(entry).some(([key, value]) => saved[key as keyof typeof saved] !== value)
+            || saved.viewport.x !== viewport.x || saved.viewport.y !== viewport.y || saved.viewport.k !== viewport.k;
+        if (changed) updateProject(projectId, { ...entry, viewport });
+    }), [createHistoryEntry, projectLoaded, projectId, updateProject]);
+    useEffect(() => () => {
+        stopCanvasGenerationRequests(generationRequestsRef.current);
+    }, []);
+
     const cleanupCanvasFiles = useCallback(
         (extra?: unknown) => {
             cleanupAssetImages({ extra, history: historyRef.current, lastHistory: lastHistoryRef.current });
@@ -304,17 +318,11 @@ function InfiniteCanvasPage() {
         [cleanupAssetImages],
     );
 
-    const startGenerationRequest = useCallback((targetNodeId: string, originNodeId: string, runningId = originNodeId, controller = new AbortController()) => {
-        const previous = generationRequestsRef.current.get(targetNodeId);
-        if (previous?.controller !== controller) previous?.controller.abort();
-        generationRequestsRef.current.set(targetNodeId, { targetNodeId, originNodeId, runningNodeId: runningId, controller });
-        return controller;
-    }, []);
+    const startGenerationRequest = useCallback((targetNodeId: string, originNodeId: string, runningId = originNodeId, controller = new AbortController()) =>
+        startCanvasGenerationRequest(generationRequestsRef.current, targetNodeId, originNodeId, runningId, controller), []);
 
-    const finishGenerationRequest = useCallback((targetNodeId: string, controller: AbortController) => {
-        const request = generationRequestsRef.current.get(targetNodeId);
-        if (request?.controller === controller) generationRequestsRef.current.delete(targetNodeId);
-    }, []);
+    const finishGenerationRequest = useCallback((targetNodeId: string, controller: AbortController) =>
+        finishCanvasGenerationRequest(generationRequestsRef.current, targetNodeId, controller), []);
 
     const completeVideoNodeTask = useCallback(
         async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, images: Parameters<typeof createVideoGenerationTask>[2], signal: AbortSignal, extra: CanvasNodeData["metadata"] = {}, videos: ReferenceVideo[] = [], audios: ReferenceAudio[] = []) => {
@@ -395,14 +403,7 @@ function InfiniteCanvasPage() {
     );
 
     const stopGenerationByRunningId = useCallback((runningId: string) => {
-        const affectedNodeIds = new Set<string>();
-        generationRequestsRef.current.forEach((request) => {
-            if (request.runningNodeId !== runningId) return;
-            request.controller.abort();
-            generationRequestsRef.current.delete(request.targetNodeId);
-            affectedNodeIds.add(request.targetNodeId);
-            affectedNodeIds.add(request.originNodeId);
-        });
+        const affectedNodeIds = stopCanvasGenerationRequests(generationRequestsRef.current, runningId);
         setRunningNodeId((current) => (current === runningId ? null : current));
         if (!affectedNodeIds.size) return;
         setNodes((prev) =>
@@ -1800,14 +1801,14 @@ function InfiniteCanvasPage() {
 
     const downloadNodeImage = useCallback((node: CanvasNodeData) => {
         if ((node.type !== CanvasNodeType.Image && node.type !== CanvasNodeType.Video && node.type !== CanvasNodeType.Audio) || !node.metadata?.content) return;
-        saveAs(node.metadata.content, `canvas-${node.type}-${node.id}.${node.type === CanvasNodeType.Video ? "mp4" : node.type === CanvasNodeType.Audio ? audioExtension(node.metadata.mimeType) : imageExtension(node.metadata.content)}`);
-    }, []);
+        downloadFile(node.metadata.content, `canvas-${node.type}-${node.id}.${node.type === CanvasNodeType.Video ? "mp4" : node.type === CanvasNodeType.Audio ? audioExtension(node.metadata.mimeType) : imageExtension(node.metadata.content)}`);
+    }, [downloadFile]);
 
     const downloadBatchImage = useCallback((node: CanvasNodeData, imageId: string) => {
         const image = node.metadata?.images?.find((item) => item.id === imageId);
         if (!image?.content) return;
-        saveAs(image.content, `canvas-image-${node.id}-${image.id}.${imageExtension(image.content)}`);
-    }, []);
+        downloadFile(image.content, `canvas-image-${node.id}-${image.id}.${imageExtension(image.content)}`);
+    }, [downloadFile]);
 
     const captureVideoNodeFrame = useCallback(
         async (nodeId: string, position: VideoFramePosition) => {
